@@ -2,5 +2,9 @@
 Thumbs.db
 *.tmp
 *.swp
+.cache/
+__pycache__/
+generated/
+results/
+work/
 artifacts/tmp/
-

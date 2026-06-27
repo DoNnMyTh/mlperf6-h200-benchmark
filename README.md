@@ -104,3 +104,45 @@ git push
 - IP address dumps
 - automatic uploads or pushes
 
+## H200 benchmark toolkit
+
+For the 4x H200 host profile captured from `t3ihpc07`, this repository now
+includes a local benchmark toolkit:
+
+- `configs/mlperf6-h200-4gpu.env`: editable paths and defaults for the H200 node
+- `scripts/bootstrap_mlperf6_h200.sh`: clones or updates the official `mlcommons/training` repo with the required submodule
+- `scripts/run_mlperf6_h200.sh`: prints or runs benchmark commands for `llama31`, `llama2_lora`, `gpt_oss20b`, `flux`, or `all`
+- `scripts/run_all_mlperf6_h200.sh`: bootstraps, downloads, runs all selected benchmarks, and writes one final report
+- `scripts/report_mlperf6_results.py`: summarizes benchmark logs into markdown
+
+Suggested sequence on the H200 node:
+
+```bash
+./scripts/bootstrap_mlperf6_h200.sh
+./scripts/run_mlperf6_h200.sh show all
+./scripts/run_mlperf6_h200.sh --execute run llama31
+./scripts/run_mlperf6_h200.sh report generated/mlperf6-h200-report.md
+```
+
+Fully automated end-to-end flow:
+
+```bash
+./scripts/run_all_mlperf6_h200.sh
+```
+
+This script:
+
+- bootstraps the upstream MLCommons training repo
+- downloads public assets for Llama 3.1, GPT-OSS 20B, and FLUX.1
+- uses the official gated Llama 2 70B LoRA downloader when `MLPERF_LLAMA2_RCLONE_CONFIG` is set
+- runs the selected benchmarks sequentially
+- writes a final markdown report to `MLPERF_FINAL_REPORT_PATH`
+
+Important caveat for Llama 2 70B LoRA:
+
+- MLCommons member-only assets are required
+- set `MLPERF_LLAMA2_RCLONE_CONFIG` in `configs/mlperf6-h200-4gpu.env` to the provided `rclone.conf`
+- without that file, the pipeline will report the Llama 2 download stage as failed while still generating the final report
+
+The generated run commands are based on the official `mlcommons/training`
+repository and adapted for a single node with 4x NVIDIA H200 NVL GPUs.

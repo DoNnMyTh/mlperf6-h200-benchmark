@@ -82,7 +82,7 @@ capture_shell() {
   return 0
 }
 
-capture_cmd "collector-date" date date -u
+capture_cmd "collector-date" date -u
 capture_cmd "os-release" cat /etc/os-release
 capture_cmd "kernel-uname" uname -a
 capture_cmd "hostnamectl" hostnamectl status
@@ -150,4 +150,3 @@ details may still be sensitive in your environment.
 EOF
 
 printf '%s\n' "${SNAPSHOT_DIR}"
-

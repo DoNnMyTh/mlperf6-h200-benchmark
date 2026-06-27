@@ -186,6 +186,7 @@ def render_markdown(
         f"- CPU affinity near GPUs: {env['MLPERF_GPU_CPU_AFFINITY']}",
         f"- GPU NUMA affinity: {env['MLPERF_GPU_NUMA_AFFINITY']}",
         f"- InfiniBand device: {env['MLPERF_IB_DEVICE']} ({env['MLPERF_IB_LINK_LAYER']})",
+        f"- Llama2 LoRA mode: {env.get('MLPERF_LLAMA2_MODE', 'official')}",
         "",
         "## Benchmark Summary",
         "",

@@ -91,6 +91,80 @@ fi
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 
+find_llama2_rclone_config() {
+  local candidates=()
+
+  if [[ -n "${MLPERF_LLAMA2_RCLONE_CONFIG:-}" ]]; then
+    candidates+=("${MLPERF_LLAMA2_RCLONE_CONFIG}")
+  fi
+
+  candidates+=(
+    "${HOME}/.config/mlperf/llama2-rclone.conf"
+    "${HOME}/.config/rclone/rclone.conf"
+  )
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "${candidate}" ]] && grep -q "\[mlc-llama2\]" "${candidate}" 2>/dev/null; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resolve_llama2_mode() {
+  local requested="${MLPERF_LLAMA2_MODE:-auto}"
+  local official_dataset_dir="${MLPERF_LLAMA2_DATASET_PATH}/${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}"
+  local official_model_dir="${MLPERF_LLAMA2_MODEL_ROOT}/${MLPERF_LLAMA2_LOCAL_MODEL_SUBDIR}"
+  local detected_rclone_config=""
+
+  detected_rclone_config="$(find_llama2_rclone_config || true)"
+
+  case "${requested}" in
+    official)
+      if [[ -d "${official_dataset_dir}" && -d "${official_model_dir}" ]]; then
+        printf 'official\n'
+      elif [[ -n "${detected_rclone_config}" ]]; then
+        printf 'official\n'
+      else
+        echo "ERROR: official llama2_lora mode requested, but no official assets or usable rclone config were found." >&2
+        return 1
+      fi
+      ;;
+    local-only)
+      if [[ -d "${official_dataset_dir}" ]]; then
+        printf 'local-only\n'
+      else
+        echo "ERROR: local-only llama2_lora mode requested, but ${official_dataset_dir} is missing." >&2
+        return 1
+      fi
+      ;;
+    smoke-test|skip)
+      printf '%s\n' "${requested}"
+      ;;
+    auto)
+      if [[ -d "${official_dataset_dir}" && -d "${official_model_dir}" ]]; then
+        printf 'official\n'
+      elif [[ -n "${detected_rclone_config}" ]]; then
+        printf 'official\n'
+      elif [[ -d "${official_dataset_dir}" ]]; then
+        printf 'local-only\n'
+      else
+        printf 'smoke-test\n'
+      fi
+      ;;
+    *)
+      echo "ERROR: unsupported MLPERF_LLAMA2_MODE=${requested}" >&2
+      return 1
+      ;;
+  esac
+}
+
+MLPERF_LLAMA2_RCLONE_CONFIG="$(find_llama2_rclone_config || true)"
+EFFECTIVE_MLPERF_LLAMA2_MODE="$(resolve_llama2_mode)"
+
 if [[ -z "${REPORT_OUTPUT}" ]]; then
   REPORT_OUTPUT="${MLPERF_FINAL_REPORT_PATH}"
 fi
@@ -203,27 +277,48 @@ download_llama31() {
 }
 
 download_llama2_lora() {
-  if [[ -d "${MLPERF_LLAMA2_DATASET_PATH}/scrolls_gov_report_8k" && -d "${MLPERF_LLAMA2_MODEL_ROOT}/Llama2-70b-fused-qkv-mlperf" ]]; then
-    record_status "llama2_lora" "download" "skipped" "Dataset and model already present"
-    return 0
-  fi
+  case "${EFFECTIVE_MLPERF_LLAMA2_MODE}" in
+    official)
+      if [[ -d "${MLPERF_LLAMA2_DATASET_PATH}/${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}" && -d "${MLPERF_LLAMA2_MODEL_ROOT}/${MLPERF_LLAMA2_LOCAL_MODEL_SUBDIR}" ]]; then
+        record_status "llama2_lora" "download" "skipped" "Official dataset and model already present"
+        return 0
+      fi
 
-  if [[ -z "${MLPERF_LLAMA2_RCLONE_CONFIG}" ]]; then
-    record_status "llama2_lora" "download" "failed" "Set MLPERF_LLAMA2_RCLONE_CONFIG to the MLCommons rclone.conf path"
-    log "Llama2 LoRA download is gated. Set MLPERF_LLAMA2_RCLONE_CONFIG to continue."
-    return 1
-  fi
+      if [[ -z "${MLPERF_LLAMA2_RCLONE_CONFIG}" ]]; then
+        record_status "llama2_lora" "download" "failed" "Set MLPERF_LLAMA2_RCLONE_CONFIG to the MLCommons rclone.conf path"
+        log "Llama2 LoRA official mode could not find a usable rclone config."
+        return 1
+      fi
 
-  require_cmd "llama2_lora" "download" "rclone" || return 1
+      require_cmd "llama2_lora" "download" "rclone" || return 1
 
-  local command_text
-  command_text=$(cat <<EOF
+      local command_text
+      command_text=$(cat <<EOF
 set -euo pipefail
 cd "${MLPERF_UPSTREAM_DIR}/llama2_70b_lora"
 bash ./scripts/download_data.sh --data_dir="${MLPERF_LLAMA2_DATASET_PATH}" --model_dir="${MLPERF_LLAMA2_MODEL_ROOT}" --rclone_config="${MLPERF_LLAMA2_RCLONE_CONFIG}"
 EOF
 )
-  run_logged "llama2_lora" "download" "${command_text}"
+      run_logged "llama2_lora" "download" "${command_text}"
+      ;;
+    local-only)
+      if [[ ! -d "${MLPERF_LLAMA2_DATASET_PATH}/${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}" ]]; then
+        record_status "llama2_lora" "download" "failed" "Local dataset not found at ${MLPERF_LLAMA2_DATASET_PATH}/${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}"
+        return 1
+      fi
+      record_status "llama2_lora" "download" "success" "Local-only mode will reuse local dataset and fetch the public HF model during run"
+      ;;
+    smoke-test)
+      record_status "llama2_lora" "download" "success" "Smoke-test mode will prepare a public GovReport subset and public model during run"
+      ;;
+    skip)
+      record_status "llama2_lora" "download" "skipped" "Llama2 benchmark skipped by configuration"
+      ;;
+    *)
+      record_status "llama2_lora" "download" "failed" "Unknown resolved mode ${EFFECTIVE_MLPERF_LLAMA2_MODE}"
+      return 1
+      ;;
+  esac
 }
 
 download_gpt_oss20b() {
@@ -277,6 +372,7 @@ on_exit() {
 trap on_exit EXIT
 
 log "Selected benchmarks: ${BENCHMARKS_CSV}"
+log "Resolved llama2_lora mode: ${EFFECTIVE_MLPERF_LLAMA2_MODE}"
 
 require_cmd "pipeline" "preflight" "docker" || handle_failure "pipeline" "preflight"
 require_cmd "pipeline" "preflight" "git" || handle_failure "pipeline" "preflight"

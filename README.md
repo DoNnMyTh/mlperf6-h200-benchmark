@@ -144,5 +144,21 @@ Important caveat for Llama 2 70B LoRA:
 - set `MLPERF_LLAMA2_RCLONE_CONFIG` in `configs/mlperf6-h200-4gpu.env` to the provided `rclone.conf`
 - without that file, the pipeline will report the Llama 2 download stage as failed while still generating the final report
 
+Llama 2 LoRA modes:
+
+- `MLPERF_LLAMA2_MODE=official`: uses MLCommons-gated dataset and model, valid for official review workflows
+- `MLPERF_LLAMA2_MODE=local-only`: uses a locally present authorized dataset plus the public Hugging Face model mirror
+- `MLPERF_LLAMA2_MODE=smoke-test`: uses the public Hugging Face model mirror plus a small public `tau/scrolls` GovReport subset for local debugging only
+- `MLPERF_LLAMA2_MODE=skip`: skips the Llama 2 benchmark entirely
+
+For `local-only`, place the local dataset under:
+
+- `${MLPERF_LLAMA2_DATASET_PATH}/${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}`
+
+For `smoke-test`, the runner will automatically materialize:
+
+- the public model from `MLPERF_LLAMA2_PUBLIC_MODEL_ID`
+- a small parquet dataset under `${MLPERF_LLAMA2_DATASET_PATH}/${MLPERF_LLAMA2_SMOKE_DATASET_SUBDIR}`
+
 The generated run commands are based on the official `mlcommons/training`
 repository and adapted for a single node with 4x NVIDIA H200 NVL GPUs.

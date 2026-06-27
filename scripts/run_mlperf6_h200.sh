@@ -56,6 +56,80 @@ fi
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
 
+find_llama2_rclone_config() {
+  local candidates=()
+
+  if [[ -n "${MLPERF_LLAMA2_RCLONE_CONFIG:-}" ]]; then
+    candidates+=("${MLPERF_LLAMA2_RCLONE_CONFIG}")
+  fi
+
+  candidates+=(
+    "${HOME}/.config/mlperf/llama2-rclone.conf"
+    "${HOME}/.config/rclone/rclone.conf"
+  )
+
+  local candidate
+  for candidate in "${candidates[@]}"; do
+    if [[ -f "${candidate}" ]] && grep -q "\[mlc-llama2\]" "${candidate}" 2>/dev/null; then
+      printf '%s\n' "${candidate}"
+      return 0
+    fi
+  done
+
+  return 1
+}
+
+resolve_llama2_mode() {
+  local requested="${MLPERF_LLAMA2_MODE:-auto}"
+  local official_dataset_dir="${MLPERF_LLAMA2_DATASET_PATH}/${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}"
+  local official_model_dir="${MLPERF_LLAMA2_MODEL_ROOT}/${MLPERF_LLAMA2_LOCAL_MODEL_SUBDIR}"
+  local detected_rclone_config=""
+
+  detected_rclone_config="$(find_llama2_rclone_config || true)"
+
+  case "${requested}" in
+    official)
+      if [[ -d "${official_dataset_dir}" && -d "${official_model_dir}" ]]; then
+        printf 'official\n'
+      elif [[ -n "${detected_rclone_config}" ]]; then
+        printf 'official\n'
+      else
+        echo "ERROR: official llama2_lora mode requested, but no official assets or usable rclone config were found." >&2
+        return 1
+      fi
+      ;;
+    local-only)
+      if [[ -d "${official_dataset_dir}" ]]; then
+        printf 'local-only\n'
+      else
+        echo "ERROR: local-only llama2_lora mode requested, but ${official_dataset_dir} is missing." >&2
+        return 1
+      fi
+      ;;
+    smoke-test|skip)
+      printf '%s\n' "${requested}"
+      ;;
+    auto)
+      if [[ -d "${official_dataset_dir}" && -d "${official_model_dir}" ]]; then
+        printf 'official\n'
+      elif [[ -n "${detected_rclone_config}" ]]; then
+        printf 'official\n'
+      elif [[ -d "${official_dataset_dir}" ]]; then
+        printf 'local-only\n'
+      else
+        printf 'smoke-test\n'
+      fi
+      ;;
+    *)
+      echo "ERROR: unsupported MLPERF_LLAMA2_MODE=${requested}" >&2
+      return 1
+      ;;
+  esac
+}
+
+MLPERF_LLAMA2_RCLONE_CONFIG="$(find_llama2_rclone_config || true)"
+EFFECTIVE_MLPERF_LLAMA2_MODE="$(resolve_llama2_mode)"
+
 ensure_upstream() {
   if [[ ! -d "${MLPERF_UPSTREAM_DIR}/.git" ]]; then
     echo "ERROR: MLCommons training repo not found at ${MLPERF_UPSTREAM_DIR}" >&2
@@ -134,18 +208,60 @@ tpu_use_cluster: false
 tpu_use_sudo: false
 use_cpu: false
 YAML
+case "${EFFECTIVE_MLPERF_LLAMA2_MODE}" in
+  official)
+    LLAMA2_DATASET_SUBDIR="${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}"
+    LLAMA2_MODEL_SUBDIR="${MLPERF_LLAMA2_LOCAL_MODEL_SUBDIR}"
+    LLAMA2_MODE_NOTE="Official MLPerf assets"
+    ;;
+  local-only)
+    LLAMA2_DATASET_SUBDIR="${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}"
+    LLAMA2_MODEL_SUBDIR="${MLPERF_LLAMA2_PUBLIC_MODEL_DIRNAME}"
+    LLAMA2_MODE_NOTE="Local dataset plus public HF model"
+    ;;
+  smoke-test)
+    LLAMA2_DATASET_SUBDIR="${MLPERF_LLAMA2_SMOKE_DATASET_SUBDIR}"
+    LLAMA2_MODEL_SUBDIR="${MLPERF_LLAMA2_PUBLIC_MODEL_DIRNAME}"
+    LLAMA2_MODE_NOTE="Non-MLPerf smoke test with public dataset/model"
+    ;;
+  skip)
+    echo "Skipping llama2_lora because effective mode is skip"
+    exit 0
+    ;;
+  *)
+    echo "ERROR: unsupported effective llama2_lora mode: ${EFFECTIVE_MLPERF_LLAMA2_MODE}" >&2
+    exit 1
+    ;;
+esac
+
+echo "Llama2 LoRA mode: \${LLAMA2_MODE_NOTE}"
+if [[ "${EFFECTIVE_MLPERF_LLAMA2_MODE}" == "smoke-test" ]]; then
+  echo "WARNING: smoke-test mode is not valid for MLPerf submission."
+fi
+
 docker pull "${MLPERF_LLAMA2_DOCKER_IMAGE}"
 docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
   -e HF_TOKEN="\${HF_TOKEN:-}" \\
+  -e MLPERF_LLAMA2_MODE="${EFFECTIVE_MLPERF_LLAMA2_MODE}" \\
+  -e MLPERF_LLAMA2_PUBLIC_MODEL_ID="${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" \\
+  -e MLPERF_LLAMA2_PUBLIC_MODEL_DIRNAME="${MLPERF_LLAMA2_PUBLIC_MODEL_DIRNAME}" \\
+  -e MLPERF_LLAMA2_SMOKE_DATASET_NAME="${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" \\
+  -e MLPERF_LLAMA2_SMOKE_DATASET_CONFIG="${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" \\
+  -e MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES="${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES}" \\
+  -e MLPERF_LLAMA2_SMOKE_VAL_SAMPLES="${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES}" \\
+  -e LLAMA2_DATASET_SUBDIR="\${LLAMA2_DATASET_SUBDIR}" \\
+  -e LLAMA2_MODEL_SUBDIR="\${LLAMA2_MODEL_SUBDIR}" \\
   -v "${MLPERF_UPSTREAM_DIR}/llama2_70b_lora:/workspace" \\
   -v "${MLPERF_LLAMA2_DATASET_PATH}:/workspace/dataset" \\
   -v "${MLPERF_LLAMA2_RESULTS_PATH}:/workspace/results" \\
   -v "${MLPERF_LLAMA2_MODEL_ROOT}:/models" \\
   -v "${MLPERF_HF_CACHE}:/root/.cache/huggingface" \\
+  -v "${REPO_ROOT}:/repo" \\
   -w /workspace \\
   "${MLPERF_LLAMA2_DOCKER_IMAGE}" \\
   bash -lc '
 set -euo pipefail
+echo "Resolved llama2_lora mode inside container: \${MLPERF_LLAMA2_MODE}"
 pip install -r requirements.txt
 pip install flash-attn==2.1.0 --no-build-isolation
 git clone --depth 1 https://github.com/mlperf/logging.git /tmp/mlperf-logging
@@ -153,10 +269,33 @@ pip install -e /tmp/mlperf-logging
 if [[ -n "\${HF_TOKEN:-}" ]]; then
   huggingface-cli login --token "\${HF_TOKEN}"
 fi
+if [[ "\${MLPERF_LLAMA2_MODE}" == "local-only" || "\${MLPERF_LLAMA2_MODE}" == "smoke-test" ]]; then
+  if [[ ! -d "/models/\${LLAMA2_MODEL_SUBDIR}" ]]; then
+    huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "/models/\${LLAMA2_MODEL_SUBDIR}"
+  fi
+fi
+if [[ "\${MLPERF_LLAMA2_MODE}" == "smoke-test" ]]; then
+  if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.parquet" ]]; then
+    python3 /repo/scripts/prepare_llama2_lora_smoke_dataset.py \\
+      --dataset-name "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" \\
+      --dataset-config "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" \\
+      --output-dir "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}" \\
+      --train-samples "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES}" \\
+      --validation-samples "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES}"
+  fi
+fi
+if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.parquet" ]]; then
+  echo "ERROR: dataset parquet missing for resolved mode \${MLPERF_LLAMA2_MODE}" >&2
+  exit 1
+fi
+if [[ ! -d "/models/\${LLAMA2_MODEL_SUBDIR}" ]]; then
+  echo "ERROR: model directory missing for resolved mode \${MLPERF_LLAMA2_MODE}" >&2
+  exit 1
+fi
 SEED="${MLPERF_LLAMA2_SEED}"
 accelerate launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
-  --dataset_path "./dataset/scrolls_gov_report_8k" \\
-  --model_path "/models/Llama2-70b-fused-qkv-mlperf" \\
+  --dataset_path "./dataset/\${LLAMA2_DATASET_SUBDIR}" \\
+  --model_path "/models/\${LLAMA2_MODEL_SUBDIR}" \\
   --max_seq_len 8192 \\
   --bf16 True \\
   --logging_steps 24 \\

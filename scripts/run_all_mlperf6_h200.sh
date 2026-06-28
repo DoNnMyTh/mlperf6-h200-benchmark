@@ -238,7 +238,21 @@ require_cmd() {
 }
 
 ensure_dir() {
-  mkdir -p "$1"
+  mkdir -p -- "$1" || return 1
+}
+
+# Resolve a path to its canonical absolute form, following symlinks when the
+# target exists. Falls back to the literal path when no resolver is available so
+# callers always get a non-empty string to compare against.
+resolve_path() {
+  local target="$1"
+  if command -v realpath > /dev/null 2>&1; then
+    realpath -- "${target}" 2>/dev/null && return 0
+  fi
+  if command -v readlink > /dev/null 2>&1; then
+    readlink -f -- "${target}" 2>/dev/null && return 0
+  fi
+  printf '%s\n' "${target}"
 }
 
 download_r2_named() {
@@ -253,7 +267,7 @@ download_r2_named() {
     return 0
   fi
 
-  ensure_dir "$(dirname "${destination}")"
+  ensure_dir "$(dirname "${destination}")" || return 1
   local command_text
   command_text=$(cat <<EOF
 set -euo pipefail
@@ -269,12 +283,49 @@ EOF
 sync_directory() {
   local source_dir="$1"
   local destination_dir="$2"
-  mkdir -p "${destination_dir}"
+
+  # Fail closed on a missing/non-directory source.
+  if [[ ! -d "${source_dir}" ]]; then
+    log "sync_directory: source is not a directory: ${source_dir}"
+    return 1
+  fi
+  # Never operate on an empty destination or the filesystem root.
+  if [[ -z "${destination_dir}" || "${destination_dir}" == "/" ]]; then
+    log "sync_directory: refusing unsafe destination: '${destination_dir}'"
+    return 1
+  fi
+
+  # Reject identical or self-recursive source/destination so an additive copy can
+  # never fold a directory into itself.
+  local source_resolved="" dest_resolved=""
+  source_resolved="$(resolve_path "${source_dir}")"
+  dest_resolved="$(resolve_path "${destination_dir}")"
+  if [[ -n "${source_resolved}" && -n "${dest_resolved}" ]]; then
+    if [[ "${source_resolved}" == "${dest_resolved}" ]]; then
+      log "sync_directory: source and destination are the same path: ${source_resolved}"
+      return 1
+    fi
+    case "${dest_resolved}/" in
+      "${source_resolved}/"*)
+        log "sync_directory: destination ${dest_resolved} is inside source ${source_resolved}"
+        return 1
+        ;;
+    esac
+    case "${source_resolved}/" in
+      "${dest_resolved}/"*)
+        log "sync_directory: source ${source_resolved} is inside destination ${dest_resolved}"
+        return 1
+        ;;
+    esac
+  fi
+
+  mkdir -p -- "${destination_dir}" || return 1
   # Additive only: never delete existing files so prior downloads stay reusable.
+  # No rm -rf, no rsync --delete -- downloaded data is always preserved.
   if command -v rsync > /dev/null 2>&1; then
-    rsync -a "${source_dir}/" "${destination_dir}/"
+    rsync -a -- "${source_dir}/" "${destination_dir}/" || return 1
   else
-    cp -a "${source_dir}/." "${destination_dir}/"
+    cp -a -- "${source_dir}/." "${destination_dir}/" || return 1
   fi
 }
 
@@ -332,18 +383,56 @@ download_gpt_oss20b() {
   # gpt_oss20b consumes the same preprocessed C4 corpus as llama31. When that
   # corpus is already downloaded and the URIs match, reuse it via a symlink
   # instead of downloading ~79 GB a second time. Non-destructive and reversible.
-  local llama31_marker="${MLPERF_LLAMA31_PREPROCESSED_PATH}/.mlperf-download-complete"
-  if [[ ! -L "${MLPERF_GPT_OSS_DATA_PATH}" \
-        && ! -e "${MLPERF_GPT_OSS_DATA_PATH}" \
-        && "${MLPERF_GPT_OSS_DATASET_URI}" == "${MLPERF_LLAMA31_DATASET_URI}" \
-        && -f "${llama31_marker}" ]]; then
-    ensure_dir "$(dirname "${MLPERF_GPT_OSS_DATA_PATH}")"
-    ln -sfn "${MLPERF_LLAMA31_PREPROCESSED_PATH}" "${MLPERF_GPT_OSS_DATA_PATH}"
-    record_status "gpt_oss20b" "download-dataset" "skipped" "Reused llama31 preprocessed C4 via symlink"
+  local data_path="${MLPERF_GPT_OSS_DATA_PATH}"
+  local llama31_path="${MLPERF_LLAMA31_PREPROCESSED_PATH}"
+  local llama31_marker="${llama31_path}/.mlperf-download-complete"
+  local uris_match=0
+  if [[ "${MLPERF_GPT_OSS_DATASET_URI}" == "${MLPERF_LLAMA31_DATASET_URI}" ]]; then
+    uris_match=1
   fi
 
-  if [[ ! -L "${MLPERF_GPT_OSS_DATA_PATH}" ]]; then
-    download_r2_named "gpt_oss20b" "dataset" "${MLPERF_GPT_OSS_DATA_PATH}" "${MLPERF_GPT_OSS_DATASET_URI}" || return 1
+  if [[ -L "${data_path}" ]]; then
+    # An existing symlink is only valid reuse when the URIs match, it resolves to
+    # the llama31 preprocessed corpus, and that corpus finished downloading.
+    # Anything else is stale/invalid: fail closed rather than feed the wrong
+    # dataset into the benchmark.
+    local link_resolved="" llama31_resolved=""
+    link_resolved="$(resolve_path "${data_path}")"
+    llama31_resolved="$(resolve_path "${llama31_path}")"
+    if [[ "${uris_match}" -eq 1 \
+          && -n "${link_resolved}" \
+          && "${link_resolved}" == "${llama31_resolved}" \
+          && -f "${llama31_marker}" ]]; then
+      record_status "gpt_oss20b" "download-dataset" "skipped" "Reused llama31 preprocessed C4 via existing symlink"
+    else
+      record_status "gpt_oss20b" "download-dataset" "failed" "Stale/invalid symlink at ${data_path}; expected a symlink to ${llama31_path} with a matching dataset URI and a completed llama31 download. Remove the symlink and re-run."
+      log "gpt_oss20b dataset symlink invalid: ${data_path} -> ${link_resolved:-<unresolved>}"
+      return 1
+    fi
+  elif [[ ! -e "${data_path}" ]]; then
+    # Nothing present yet. Reuse llama31's corpus when the URIs match and its
+    # download completed; otherwise download gpt_oss20b's own copy.
+    if [[ "${uris_match}" -eq 1 && -f "${llama31_marker}" ]]; then
+      if ! ensure_dir "$(dirname "${data_path}")"; then
+        record_status "gpt_oss20b" "download-dataset" "failed" "Failed to create parent dir for ${data_path}"
+        log "gpt_oss20b dataset reuse failed: cannot create $(dirname "${data_path}")"
+        return 1
+      fi
+      if ln -sfn "${llama31_path}" "${data_path}"; then
+        record_status "gpt_oss20b" "download-dataset" "skipped" "Reused llama31 preprocessed C4 via symlink"
+      else
+        record_status "gpt_oss20b" "download-dataset" "failed" "Failed to create reuse symlink ${data_path} -> ${llama31_path}"
+        log "gpt_oss20b dataset reuse symlink creation failed"
+        return 1
+      fi
+    else
+      download_r2_named "gpt_oss20b" "dataset" "${data_path}" "${MLPERF_GPT_OSS_DATASET_URI}" || return 1
+    fi
+  else
+    # A real directory/file already exists. Preserve reusable behavior:
+    # download_r2_named skips when its completion marker is present, otherwise it
+    # resumes/fills in place. Never delete what is already on disk.
+    download_r2_named "gpt_oss20b" "dataset" "${data_path}" "${MLPERF_GPT_OSS_DATASET_URI}" || return 1
   fi
 
   if [[ ! -d "${MLPERF_GPT_OSS_TOKENIZER_SOURCE}" ]]; then
@@ -351,7 +440,11 @@ download_gpt_oss20b() {
     return 1
   fi
 
-  sync_directory "${MLPERF_GPT_OSS_TOKENIZER_SOURCE}" "${MLPERF_GPT_OSS_MODEL_PATH}"
+  if ! sync_directory "${MLPERF_GPT_OSS_TOKENIZER_SOURCE}" "${MLPERF_GPT_OSS_MODEL_PATH}"; then
+    record_status "gpt_oss20b" "tokenizer" "failed" "Failed to sync tokenizer from ${MLPERF_GPT_OSS_TOKENIZER_SOURCE} to ${MLPERF_GPT_OSS_MODEL_PATH}"
+    log "gpt_oss20b tokenizer sync failed"
+    return 1
+  fi
   record_status "gpt_oss20b" "tokenizer" "success" "Synced tokenizer into ${MLPERF_GPT_OSS_MODEL_PATH}"
 }
 
@@ -410,7 +503,12 @@ else
 fi
 
 download_benchmark() {
-  local benchmark="$1"
+  local benchmark="${1:-}"
+  if [[ -z "${benchmark}" ]]; then
+    record_status "unknown" "download" "failed" "Empty benchmark name passed to download_benchmark"
+    log "download_benchmark called with an empty benchmark name"
+    return 1
+  fi
   case "${benchmark}" in
     llama31)     download_llama31 ;;
     llama2_lora) download_llama2_lora ;;
@@ -418,14 +516,18 @@ download_benchmark() {
     flux)        download_flux ;;
     *)
       record_status "${benchmark}" "download" "failed" "Unknown benchmark"
+      log "download_benchmark called with an unknown benchmark: ${benchmark}"
       return 1
       ;;
   esac
 }
 
 # Process one benchmark fully before starting the next: download its data, then
-# run it. This bounds peak disk use to one benchmark's assets at a time and lets
-# results land incrementally instead of after every dataset is fetched.
+# run it. This keeps active downloading/running scoped to a single benchmark at a
+# time and lets results land incrementally instead of after every dataset is
+# fetched. Note: persistent disk usage still accumulates across benchmarks --
+# downloaded data is retained for reuse and never deleted, so this bounds the
+# active working set, not the total on-disk footprint.
 for benchmark in "${BENCHMARKS[@]}"; do
   log "=== Benchmark ${benchmark}: download then run ==="
 

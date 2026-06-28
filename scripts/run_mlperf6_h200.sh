@@ -174,6 +174,20 @@ export TMP_NPY_INDEX="${MLPERF_LLAMA31_INDEX_PATH}"
 export GBS="${MLPERF_LLAMA31_GBS}"
 export MBS="${MLPERF_LLAMA31_MBS}"
 export CUDA_HOME="${MLPERF_CUDA_HOME}"
+# Upstream run_llama31.sh does a host-side 'mkdir /mlperf-outputs' for the local
+# MLLogger and assumes it runs as root. As a non-root user that fails with
+# "Permission denied". Ensure the directory exists and is writable up front,
+# trying a plain mkdir, then non-interactive sudo, and finally failing with a
+# clear one-time remediation step instead of a cryptic error mid-run.
+if [ ! -d /mlperf-outputs ]; then
+  mkdir -p /mlperf-outputs 2>/dev/null \
+    || sudo -n mkdir -p /mlperf-outputs 2>/dev/null \
+    || { echo "ERROR: /mlperf-outputs missing and not creatable. Run once: sudo mkdir -p /mlperf-outputs && sudo chown \$(id -un) /mlperf-outputs" >&2; exit 1; }
+fi
+if [ ! -w /mlperf-outputs ]; then
+  sudo -n chown "\$(id -un)" /mlperf-outputs 2>/dev/null \
+    || { echo "ERROR: /mlperf-outputs not writable by \$(id -un). Run once: sudo chown \$(id -un) /mlperf-outputs" >&2; exit 1; }
+fi
 bash ./run_llama31.sh
 EOF
 }
@@ -270,9 +284,17 @@ if [[ -n "\${HF_TOKEN:-}" ]]; then
   huggingface-cli login --token "\${HF_TOKEN}"
 fi
 if [[ "\${MLPERF_LLAMA2_MODE}" == "local-only" || "\${MLPERF_LLAMA2_MODE}" == "smoke-test" ]]; then
-  if [[ ! -d "/models/\${LLAMA2_MODEL_SUBDIR}" ]]; then
-    huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "/models/\${LLAMA2_MODEL_SUBDIR}"
-  fi
+  # Always invoke the downloader. huggingface-cli download resumes and only
+  # fetches missing files, so an earlier interrupted run that left an INCOMPLETE
+  # model directory is repaired instead of being wrongly treated as complete
+  # (the previous "dir exists -> skip" check produced a missing modeling_llama.py).
+  huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "/models/\${LLAMA2_MODEL_SUBDIR}"
+  for required in config.json modeling_llama.py model.safetensors.index.json; do
+    if [[ ! -f "/models/\${LLAMA2_MODEL_SUBDIR}/\${required}" ]]; then
+      echo "ERROR: required model file still missing after download: /models/\${LLAMA2_MODEL_SUBDIR}/\${required}" >&2
+      exit 1
+    fi
+  done
 fi
 if [[ "\${MLPERF_LLAMA2_MODE}" == "smoke-test" ]]; then
   if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.parquet" ]]; then

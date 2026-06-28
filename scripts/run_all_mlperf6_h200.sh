@@ -10,7 +10,11 @@ CONTINUE_ON_FAILURE=1
 SKIP_BOOTSTRAP=0
 SKIP_DOWNLOADS=0
 SKIP_RUNS=0
-BENCHMARKS_CSV="llama31,llama2_lora,gpt_oss20b,flux"
+# Default: run ALL four benchmarks. Order is deliberate:
+#   - llama31 before gpt_oss20b: gpt_oss20b reuses llama31's downloaded C4 corpus
+#   - flux LAST: it has by far the largest download (~2.23 TB), so the cheaper
+#     benchmarks finish first and the big pull happens once everything else is done
+BENCHMARKS_CSV="llama31,gpt_oss20b,llama2_lora,flux"
 
 usage() {
   cat <<'EOF'
@@ -29,9 +33,13 @@ Options:
 
 Behavior:
   - bootstraps the official mlcommons/training repo
+  - for each benchmark in order: downloads its data, then runs it, before
+    moving on to the next benchmark (download-one, run-one, repeat)
   - downloads public benchmark assets where official public URIs exist
+  - reuses already-downloaded assets (completion markers, gpt_oss20b reuses the
+    llama31 C4 corpus) and never deletes downloaded data
   - uses the gated upstream Llama2 downloader when MLPERF_LLAMA2_RCLONE_CONFIG is set
-  - runs the selected benchmarks sequentially
+  - skips a benchmark's run when its own download stage failed
   - always attempts to write a final report, even if some stages fail
 EOF
 }
@@ -262,11 +270,10 @@ sync_directory() {
   local source_dir="$1"
   local destination_dir="$2"
   mkdir -p "${destination_dir}"
+  # Additive only: never delete existing files so prior downloads stay reusable.
   if command -v rsync > /dev/null 2>&1; then
-    rsync -a --delete "${source_dir}/" "${destination_dir}/"
+    rsync -a "${source_dir}/" "${destination_dir}/"
   else
-    rm -rf "${destination_dir}"
-    mkdir -p "${destination_dir}"
     cp -a "${source_dir}/." "${destination_dir}/"
   fi
 }
@@ -322,7 +329,22 @@ EOF
 }
 
 download_gpt_oss20b() {
-  download_r2_named "gpt_oss20b" "dataset" "${MLPERF_GPT_OSS_DATA_PATH}" "${MLPERF_GPT_OSS_DATASET_URI}" || return 1
+  # gpt_oss20b consumes the same preprocessed C4 corpus as llama31. When that
+  # corpus is already downloaded and the URIs match, reuse it via a symlink
+  # instead of downloading ~79 GB a second time. Non-destructive and reversible.
+  local llama31_marker="${MLPERF_LLAMA31_PREPROCESSED_PATH}/.mlperf-download-complete"
+  if [[ ! -L "${MLPERF_GPT_OSS_DATA_PATH}" \
+        && ! -e "${MLPERF_GPT_OSS_DATA_PATH}" \
+        && "${MLPERF_GPT_OSS_DATASET_URI}" == "${MLPERF_LLAMA31_DATASET_URI}" \
+        && -f "${llama31_marker}" ]]; then
+    ensure_dir "$(dirname "${MLPERF_GPT_OSS_DATA_PATH}")"
+    ln -sfn "${MLPERF_LLAMA31_PREPROCESSED_PATH}" "${MLPERF_GPT_OSS_DATA_PATH}"
+    record_status "gpt_oss20b" "download-dataset" "skipped" "Reused llama31 preprocessed C4 via symlink"
+  fi
+
+  if [[ ! -L "${MLPERF_GPT_OSS_DATA_PATH}" ]]; then
+    download_r2_named "gpt_oss20b" "dataset" "${MLPERF_GPT_OSS_DATA_PATH}" "${MLPERF_GPT_OSS_DATASET_URI}" || return 1
+  fi
 
   if [[ ! -d "${MLPERF_GPT_OSS_TOKENIZER_SOURCE}" ]]; then
     record_status "gpt_oss20b" "tokenizer" "failed" "Tokenizer source missing: ${MLPERF_GPT_OSS_TOKENIZER_SOURCE}"
@@ -387,37 +409,48 @@ else
   record_status "pipeline" "bootstrap" "skipped" "Bootstrap skipped by user"
 fi
 
-if [[ "${SKIP_DOWNLOADS}" -eq 0 ]]; then
-  for benchmark in "${BENCHMARKS[@]}"; do
-    case "${benchmark}" in
-      llama31)
-        download_llama31 || handle_failure "${benchmark}" "download"
-        ;;
-      llama2_lora)
-        download_llama2_lora || handle_failure "${benchmark}" "download"
-        ;;
-      gpt_oss20b)
-        download_gpt_oss20b || handle_failure "${benchmark}" "download"
-        ;;
-      flux)
-        download_flux || handle_failure "${benchmark}" "download"
-        ;;
-      *)
-        record_status "${benchmark}" "download" "failed" "Unknown benchmark"
-        handle_failure "${benchmark}" "download"
-        ;;
-    esac
-  done
-else
-  record_status "pipeline" "download" "skipped" "Downloads skipped by user"
-fi
+download_benchmark() {
+  local benchmark="$1"
+  case "${benchmark}" in
+    llama31)     download_llama31 ;;
+    llama2_lora) download_llama2_lora ;;
+    gpt_oss20b)  download_gpt_oss20b ;;
+    flux)        download_flux ;;
+    *)
+      record_status "${benchmark}" "download" "failed" "Unknown benchmark"
+      return 1
+      ;;
+  esac
+}
 
-if [[ "${SKIP_RUNS}" -eq 0 ]]; then
-  for benchmark in "${BENCHMARKS[@]}"; do
-    run_benchmark "${benchmark}" || handle_failure "${benchmark}" "run"
-  done
-else
-  record_status "pipeline" "run" "skipped" "Benchmark execution skipped by user"
-fi
+# Process one benchmark fully before starting the next: download its data, then
+# run it. This bounds peak disk use to one benchmark's assets at a time and lets
+# results land incrementally instead of after every dataset is fetched.
+for benchmark in "${BENCHMARKS[@]}"; do
+  log "=== Benchmark ${benchmark}: download then run ==="
+
+  download_ok=1
+  if [[ "${SKIP_DOWNLOADS}" -eq 0 ]]; then
+    if ! download_benchmark "${benchmark}"; then
+      download_ok=0
+      handle_failure "${benchmark}" "download"
+    fi
+  else
+    record_status "${benchmark}" "download" "skipped" "Downloads skipped by user"
+  fi
+
+  if [[ "${SKIP_RUNS}" -eq 1 ]]; then
+    record_status "${benchmark}" "run" "skipped" "Benchmark execution skipped by user"
+    continue
+  fi
+
+  if [[ "${download_ok}" -eq 0 ]]; then
+    record_status "${benchmark}" "run" "skipped" "Download stage failed"
+    log "Skipping ${benchmark}/run because its download stage failed"
+    continue
+  fi
+
+  run_benchmark "${benchmark}" || handle_failure "${benchmark}" "run"
+done
 
 log "Pipeline completed. Report will be generated by the exit handler."

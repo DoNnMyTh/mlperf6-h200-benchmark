@@ -133,10 +133,42 @@ Fully automated end-to-end flow:
 This script:
 
 - bootstraps the upstream MLCommons training repo
+- processes one benchmark at a time: it downloads that benchmark's data, runs
+  it, and only then moves on to the next benchmark (download-one, run-one,
+  repeat) — so peak disk usage is bounded to one benchmark's assets and results
+  land incrementally instead of after every dataset is fetched
 - downloads public assets for Llama 3.1, GPT-OSS 20B, and FLUX.1
+- reuses anything already downloaded (per-directory completion markers) and
+  never deletes downloaded data; `gpt_oss20b` reuses the llama31 C4 corpus via a
+  symlink instead of re-downloading it
 - uses the official gated Llama 2 70B LoRA downloader when `MLPERF_LLAMA2_RCLONE_CONFIG` is set
-- runs the selected benchmarks sequentially
+- skips a benchmark's run when its own download stage failed
 - writes a final markdown report to `MLPERF_FINAL_REPORT_PATH`
+
+### Download footprint
+
+Sizes below are the public download-stage assets pulled by the orchestrator,
+measured from the MLCommons R2 manifests. They land under `MLPERF_DATA_ROOT`
+(default `/scratch/...`, which on this node has ~321 TB free).
+
+| Benchmark | Download-stage assets | Approx size |
+| --- | --- | --- |
+| `llama31` | preprocessed C4 corpus (~79 GB) + 8B tokenizer/model (~30 GB) | **~109 GB** |
+| `gpt_oss20b` | reuses the llama31 C4 corpus + synced tokenizer | **~0 GB extra** |
+| `flux` | CC12M preprocessed (~2.17 TB) + COCO preprocessed (~60 GB) + empty encodings (~2 MB) | **~2.23 TB** |
+| `llama2_lora` | 70B model pulled at run time (~128 GB) + dataset (gated, small; smoke-test subset is tiny) | **~128 GB** |
+
+- **The default run executes all four benchmarks**, in the order
+  `llama31,gpt_oss20b,llama2_lora,flux`. `flux` (the largest download, ~2.23 TB)
+  runs last so the cheaper benchmarks complete first; `llama31` runs before
+  `gpt_oss20b` because gpt_oss20b reuses its C4 corpus.
+- **Total downloads ≈ 2.46 TB** (~109 GB llama31 + ~0 gpt_oss20b reuse +
+  ~128 GB llama2 70B model at run time + ~2.23 TB flux).
+- Because the pipeline is download-one/run-one, only one benchmark's assets are
+  being fetched at any moment; with the `--skip-runs` flag you can pre-stage all
+  data first instead.
+- Re-running is cheap: completion markers make already-downloaded datasets skip
+  instantly, and nothing on disk is deleted between runs.
 
 Important caveat for Llama 2 70B LoRA:
 

@@ -182,7 +182,7 @@ export CUDA_HOME="${MLPERF_CUDA_HOME}"
 # (root/sudo when available), then make the upstream mkdir non-fatal so the run
 # proceeds without root; the container still gets /mlperf-outputs via the mount.
 mkdir -p /mlperf-outputs 2>/dev/null || sudo -n mkdir -p /mlperf-outputs 2>/dev/null || true
-sed -i 's|mkdir /mlperf-outputs; fi|mkdir -p /mlperf-outputs 2>/dev/null || true; fi|' run_llama31.sh
+sed -i 's@mkdir /mlperf-outputs; fi@mkdir -p /mlperf-outputs 2>/dev/null || true; fi@' run_llama31.sh
 bash ./run_llama31.sh
 EOF
 }
@@ -287,7 +287,24 @@ if [[ "\${MLPERF_LLAMA2_MODE}" == "local-only" || "\${MLPERF_LLAMA2_MODE}" == "s
   # fetches missing files, so an earlier interrupted run that left an INCOMPLETE
   # model directory is repaired instead of being wrongly treated as complete
   # (the previous "dir exists -> skip" check produced a missing modeling_llama.py).
-  huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "/models/\${LLAMA2_MODEL_SUBDIR}"
+  # The 70B model is ~128 GB. On this node the writer intermittently dies mid
+  # download (hf-xet "Background writer channel closed", then plain http_get
+  # "[Errno 14] Bad address" writing to lustre). Each attempt resumes and only
+  # fetches what is missing, so retry a few times with fewer parallel writers;
+  # this completes the remaining shards across attempts.
+  model_download_ok=0
+  for attempt in 1 2 3 4 5 6; do
+    if huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "/models/\${LLAMA2_MODEL_SUBDIR}" --max-workers 4; then
+      model_download_ok=1
+      break
+    fi
+    echo "llama2 model download attempt \${attempt} failed; resuming and retrying"
+    sleep 5
+  done
+  if [[ "\${model_download_ok}" -ne 1 ]]; then
+    echo "ERROR: llama2 model download did not complete after repeated attempts" >&2
+    exit 1
+  fi
   for required in config.json modeling_llama.py model.safetensors.index.json; do
     if [[ ! -f "/models/\${LLAMA2_MODEL_SUBDIR}/\${required}" ]]; then
       echo "ERROR: required model file still missing after download: /models/\${LLAMA2_MODEL_SUBDIR}/\${required}" >&2
@@ -435,6 +452,15 @@ export LOGDIR="${MLPERF_GPT_OSS_RESULTS_PATH}"
 export HF_TOKEN="\${HF_TOKEN:-}"
 export NEXP="${MLPERF_GPT_OSS_NEXP}"
 export CLEAR_CACHES="${MLPERF_GPT_OSS_CLEAR_CACHES}"
+# run_with_docker.sh forwards the benchmark settings into the container as bare
+# '--env=NAME' flags, i.e. it passes through THIS shell's value for each NAME.
+# Those settings (NODE_RANK, MASTER_ADDR, MASTER_PORT, NNODES and the
+# PRIMUS_*/MLLOG_* vars) live in config_H200_1x4x1.sh, so source it here to
+# export them; otherwise NODE_RANK arrives empty and torchrun aborts with
+# "argument --node-rank: invalid int value: ''".
+set -a
+source ./config_H200_1x4x1.sh
+set +a
 bash ./run_with_docker.sh
 EOF
 }

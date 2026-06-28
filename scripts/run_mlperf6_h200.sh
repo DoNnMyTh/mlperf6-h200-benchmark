@@ -408,6 +408,17 @@ export MLLOG_SUBMISSION_PLATFORM=H200-4GPU
 export HF_TOKEN="\${HF_TOKEN:-}"
 CFG
 chmod +x config_H200_1x4x1.sh
+# Upstream Dockerfile.nvidia clones Primus and runs 'git checkout main', then
+# applies primus_evaluator.patch. Primus main has since moved (the evaluator fix
+# was upstreamed in 8c5bc42d), so that patch no longer applies and the build
+# fails. Pin Primus to ${MLPERF_GPT_OSS_PRIMUS_REF} -- the newest commit whose
+# evaluator.py still matches the patch base (blob f7df2870) -- so both MLPerf
+# patches apply cleanly. Idempotent: only the literal 'git checkout main' is
+# rewritten, so re-runs over an already-pinned Dockerfile are a no-op.
+if grep -q 'git checkout main' Dockerfile.nvidia; then
+  sed -i "s|git checkout main|git checkout ${MLPERF_GPT_OSS_PRIMUS_REF}|" Dockerfile.nvidia
+  echo "Pinned Primus to ${MLPERF_GPT_OSS_PRIMUS_REF} in Dockerfile.nvidia"
+fi
 docker build -t "${MLPERF_GPT_OSS_IMAGE}" -f Dockerfile.nvidia .
 export DGXSYSTEM=H200_1x4x1
 export CONT="${MLPERF_GPT_OSS_IMAGE}"

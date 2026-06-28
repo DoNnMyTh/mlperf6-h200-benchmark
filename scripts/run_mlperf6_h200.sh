@@ -174,20 +174,15 @@ export TMP_NPY_INDEX="${MLPERF_LLAMA31_INDEX_PATH}"
 export GBS="${MLPERF_LLAMA31_GBS}"
 export MBS="${MLPERF_LLAMA31_MBS}"
 export CUDA_HOME="${MLPERF_CUDA_HOME}"
-# Upstream run_llama31.sh does a host-side 'mkdir /mlperf-outputs' for the local
-# MLLogger and assumes it runs as root. As a non-root user that fails with
-# "Permission denied". Ensure the directory exists and is writable up front,
-# trying a plain mkdir, then non-interactive sudo, and finally failing with a
-# clear one-time remediation step instead of a cryptic error mid-run.
-if [ ! -d /mlperf-outputs ]; then
-  mkdir -p /mlperf-outputs 2>/dev/null \
-    || sudo -n mkdir -p /mlperf-outputs 2>/dev/null \
-    || { echo "ERROR: /mlperf-outputs missing and not creatable. Run once: sudo mkdir -p /mlperf-outputs && sudo chown \$(id -un) /mlperf-outputs" >&2; exit 1; }
-fi
-if [ ! -w /mlperf-outputs ]; then
-  sudo -n chown "\$(id -un)" /mlperf-outputs 2>/dev/null \
-    || { echo "ERROR: /mlperf-outputs not writable by \$(id -un). Run once: sudo chown \$(id -un) /mlperf-outputs" >&2; exit 1; }
-fi
+# Upstream run_llama31.sh runs under 'set -e' and does a host-side
+# 'mkdir /mlperf-outputs', which assumes root and aborts the whole run for a
+# non-root user ("Permission denied"). On the host that directory is vestigial:
+# /mlperf-outputs is only a container bind-mount target (mapped from JOB_DIR in
+# MOUNTS), and pretrain_llama31.py never reads it. So best-effort create it
+# (root/sudo when available), then make the upstream mkdir non-fatal so the run
+# proceeds without root; the container still gets /mlperf-outputs via the mount.
+mkdir -p /mlperf-outputs 2>/dev/null || sudo -n mkdir -p /mlperf-outputs 2>/dev/null || true
+sed -i 's|mkdir /mlperf-outputs; fi|mkdir -p /mlperf-outputs 2>/dev/null || true; fi|' run_llama31.sh
 bash ./run_llama31.sh
 EOF
 }
@@ -275,6 +270,10 @@ docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=6710886
   "${MLPERF_LLAMA2_DOCKER_IMAGE}" \\
   bash -lc '
 set -euo pipefail
+# Disable the hf-xet transfer backend: on this node it crashed mid-download with
+# "Internal Writer Error: Background writer channel closed" while resuming the
+# 70B model. Plain HTTPS download is slower but resumes reliably.
+export HF_HUB_DISABLE_XET=1
 echo "Resolved llama2_lora mode inside container: \${MLPERF_LLAMA2_MODE}"
 pip install -r requirements.txt
 pip install flash-attn==2.1.0 --no-build-isolation
@@ -418,6 +417,14 @@ chmod +x config_H200_1x4x1.sh
 if grep -q 'git checkout main' Dockerfile.nvidia; then
   sed -i "s|git checkout main|git checkout ${MLPERF_GPT_OSS_PRIMUS_REF}|" Dockerfile.nvidia
   echo "Pinned Primus to ${MLPERF_GPT_OSS_PRIMUS_REF} in Dockerfile.nvidia"
+fi
+# Upstream Dockerfile.nvidia hardcodes 'pip install primus_mllog-0.1.0-...whl',
+# but the dir actually ships a different version (e.g. primus_mllog-0.1.20),
+# so the build fails with "No such file". Rewrite the exact version to a glob so
+# whichever primus_mllog wheel is present in the build context is installed.
+if grep -q 'pip install primus_mllog-0.1.0-py3-none-any.whl' Dockerfile.nvidia; then
+  sed -i 's|pip install primus_mllog-0.1.0-py3-none-any.whl|pip install primus_mllog-*-py3-none-any.whl|' Dockerfile.nvidia
+  echo "Rewrote primus_mllog wheel install to a version glob in Dockerfile.nvidia"
 fi
 docker build -t "${MLPERF_GPT_OSS_IMAGE}" -f Dockerfile.nvidia .
 export DGXSYSTEM=H200_1x4x1

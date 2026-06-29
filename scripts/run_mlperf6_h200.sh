@@ -155,8 +155,17 @@ render_llama31() {
 set -euo pipefail
 mkdir -p "${MLPERF_LLAMA31_RESULTS_PATH}" "${MLPERF_LLAMA31_CHECKPOINT_PATH}" "${MLPERF_LLAMA31_INDEX_PATH}"
 cd "${MLPERF_UPSTREAM_DIR}/small_llm_pretraining/nemo"
+# pretrain_llama31.py does 'import wandb' unconditionally, but Dockerfile.h200
+# does not install it, so the container aborts with ModuleNotFoundError. Append
+# the install plus offline mode (so wandb.init needs no API key). Idempotent:
+# only added once, so re-runs over an already-patched Dockerfile are a no-op.
+if ! grep -q 'pip install wandb' Dockerfile.h200; then
+  printf '\nRUN pip install --no-cache-dir wandb\nENV WANDB_MODE=offline\n' >> Dockerfile.h200
+  echo "Added wandb install + offline mode to Dockerfile.h200"
+fi
 docker build -t "${MLPERF_LLAMA31_IMAGE}" -f Dockerfile.h200 .
 source ./config_H200_1x8x1_8b.sh
+export WANDB_MODE="\${WANDB_MODE:-offline}"
 export USER="\${USER:-local}"
 export HOST="\${HOST:-local}"
 export ACCOUNT="\${ACCOUNT:-local}"
@@ -274,6 +283,10 @@ set -euo pipefail
 # "Internal Writer Error: Background writer channel closed" while resuming the
 # 70B model. Plain HTTPS download is slower but resumes reliably.
 export HF_HUB_DISABLE_XET=1
+# The accelerated hf_transfer (rust) writer intermittently dies on this node's
+# lustre mount with "[Errno 14] Bad address" mid-download of the 70B shards.
+# Disable it so writes go through plain Python http_get, which resumes reliably.
+export HF_HUB_ENABLE_HF_TRANSFER=0
 echo "Resolved llama2_lora mode inside container: \${MLPERF_LLAMA2_MODE}"
 pip install -r requirements.txt
 pip install flash-attn==2.1.0 --no-build-isolation
@@ -293,8 +306,8 @@ if [[ "\${MLPERF_LLAMA2_MODE}" == "local-only" || "\${MLPERF_LLAMA2_MODE}" == "s
   # fetches what is missing, so retry a few times with fewer parallel writers;
   # this completes the remaining shards across attempts.
   model_download_ok=0
-  for attempt in 1 2 3 4 5 6; do
-    if huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "/models/\${LLAMA2_MODEL_SUBDIR}" --max-workers 4; then
+  for attempt in 1 2 3 4 5 6 7 8 9 10; do
+    if huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "/models/\${LLAMA2_MODEL_SUBDIR}" --max-workers 1; then
       model_download_ok=1
       break
     fi
@@ -375,7 +388,7 @@ export MASTER_ADDR=localhost
 export MASTER_PORT=29501
 
 export PRIMUS_PATH=/workspace/deps/Primus
-export PYTHONPATH="\${PRIMUS_PATH}:\${PRIMUS_PATH}/third_party/Megatron-LM:\${PYTHONPATH}"
+export PYTHONPATH="\${PRIMUS_PATH}:\${PRIMUS_PATH}/third_party/Megatron-LM:\${PYTHONPATH:-}"
 export EXP=/workspace/code/conf/gpt_oss_20B-pretrain-nvidia.yaml
 export DATA_PATH=/data
 export MODEL=/model

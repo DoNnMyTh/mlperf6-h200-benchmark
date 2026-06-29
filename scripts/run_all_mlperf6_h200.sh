@@ -269,11 +269,39 @@ download_r2_named() {
 
   ensure_dir "$(dirname "${destination}")" || return 1
   local command_text
+  # The MLCommons R2 downloader fetches every shard with `wget --continue`, then
+  # verifies them with `md5sum -c`. On a flaky link a shard can land truncated or
+  # corrupt at its full expected size; wget then treats it as complete and SKIPS
+  # it on every re-run, so md5 verification fails forever and a plain retry never
+  # converges (this is exactly how flux/cc12m-preprocessed failed: "Download
+  # completed successfully!" followed by hundreds of "data-*.arrow: FAILED").
+  # Wrap the download in a repair loop: on failure, parse the copied .md5 file,
+  # delete only the shards that failed verification, and re-invoke -- wget then
+  # re-fetches the now-missing shards and skips the good ones, so the dataset
+  # completes across attempts. Only mark the download complete on full success.
   command_text=$(cat <<EOF
 set -euo pipefail
 mkdir -p "$(dirname "${destination}")"
 cd "$(dirname "${destination}")"
-bash <(curl -fsSL "${MLPERF_R2_DOWNLOADER_URL}") -d "$(basename "${destination}")" "${uri}"
+r2_attempts=${MLPERF_R2_DOWNLOAD_RETRIES:-5}
+r2_ok=0
+for r2_attempt in \$(seq 1 "\${r2_attempts}"); do
+  if bash <(curl -fsSL "${MLPERF_R2_DOWNLOADER_URL}") -d "$(basename "${destination}")" "${uri}"; then
+    r2_ok=1
+    break
+  fi
+  echo "r2 download/verify attempt \${r2_attempt}/\${r2_attempts} failed for $(basename "${destination}"); pruning corrupt shards before retry"
+  md5_file=\$(ls "${destination}"/*.md5 2>/dev/null | head -n1 || true)
+  if [[ -n "\${md5_file}" && -f "\${md5_file}" ]]; then
+    ( cd "${destination}" && md5sum -c "\$(basename "\${md5_file}")" 2>/dev/null \\
+        | awk -F': ' '/: FAILED\$/{print \$1}' \\
+        | while IFS= read -r bad; do [[ -n "\${bad}" ]] && rm -f -- "\${bad}"; done ) || true
+  fi
+done
+if [[ "\${r2_ok}" -ne 1 ]]; then
+  echo "ERROR: r2 download for $(basename "${destination}") did not complete after \${r2_attempts} attempts" >&2
+  exit 1
+fi
 touch "${completion_marker}"
 EOF
 )

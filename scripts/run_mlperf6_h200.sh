@@ -95,27 +95,34 @@ MLPERF_QUICK_FLUX_STEPS="${MLPERF_QUICK_FLUX_STEPS:-1000000}"
 # fractional 976562.5 that lightning rejected. flux/gpt_oss only need "large".
 MLPERF_QUICK_EVAL_DISABLE="${MLPERF_QUICK_EVAL_DISABLE:-1073741824}"
 
-# Render-time helper: emits a `timeout ...` prefix for the training launch when
-# quick-run is on, otherwise nothing. Used inside the render heredocs via $(...).
+# Render-time helper: emits the `timeout ...` prefix for the training launch when
+# quick-run is on (plus a pre-clean of any stale same-named container), otherwise
+# nothing. Pass the container name the launch uses so it can be cleaned up.
 quick_timeout_prefix() {
-  if [[ "${MLPERF_QUICK_RUN}" == "1" ]]; then
-    printf 'timeout --signal=TERM --kill-after=60 %s ' "${MLPERF_QUICK_RUN_SECONDS}"
-  fi
+  [[ "${MLPERF_QUICK_RUN}" == "1" ]] || return 0
+  local cname="${1:-}"
+  [[ -n "${cname}" ]] && printf 'docker rm -f %s >/dev/null 2>&1 || true\n' "${cname}"
+  printf 'timeout --signal=TERM --kill-after=60 %s ' "${MLPERF_QUICK_RUN_SECONDS}"
 }
-# Render-time helper: emits the trailing handler that converts a timeout (124)
-# into success. It begins with " || quick_ec=$?" so it attaches to the end of the
-# (possibly multi-line) launch command. Emits nothing outside quick-run.
+# Render-time helper: trailing handler for the quick-run launch. It (1) captures
+# the exit code, (2) FORCE-REMOVES the container -- timeout SIGKILLs the `docker
+# run` CLI but leaves the container running (holding the GPUs and blocking every
+# later benchmark), so an explicit `docker rm -f` is the only reliable cleanup,
+# (3) treats a timeout kill as success. GNU timeout returns 124, or 137/143 when
+# --kill-after escalates to SIGKILL/SIGTERM on a process that ignores the signal;
+# all three mean "the perf window ended", whereas a real crash exits 1/other.
 quick_timeout_suffix() {
-  if [[ "${MLPERF_QUICK_RUN}" == "1" ]]; then
-    cat <<'SUF'
- || quick_ec=$?
-if [ "${quick_ec:-0}" -eq 124 ]; then
-  echo "quick-run: sustained perf window reached (timeout ${MLPERF_QUICK_RUN_SECONDS:-3600}s); treating as success"
-elif [ "${quick_ec:-0}" -ne 0 ]; then
-  exit "${quick_ec}"
-fi
+  [[ "${MLPERF_QUICK_RUN}" == "1" ]] || return 0
+  local cname="${1:-}"
+  printf ' || quick_ec=$?\n'
+  [[ -n "${cname}" ]] && printf 'docker rm -f %s >/dev/null 2>&1 || true\n' "${cname}"
+  cat <<'SUF'
+case "${quick_ec:-0}" in
+  0) : ;;
+  124|137|143) echo "quick-run: perf window reached (container stopped); treating as success" ;;
+  *) exit "${quick_ec}" ;;
+esac
 SUF
-  fi
 }
 
 find_llama2_rclone_config() {
@@ -246,7 +253,7 @@ docker build -t "${MLPERF_LLAMA31_IMAGE}" -f Dockerfile.h200 .
 # under /scratch on this node, so a single bind mount makes all the absolute host
 # paths below resolve identically inside the container; mount the results dir at
 # /mlperf-outputs too so MLLog output persists past the --rm container.
-$(quick_timeout_prefix)docker run --rm --gpus all --ipc=host --network host \\
+$(quick_timeout_prefix mlperf-llama31)docker run --rm --name mlperf-llama31 --gpus all --ipc=host --network host \\
   --ulimit memlock=-1 --ulimit stack=67108864 \\
   -v /scratch:/scratch \\
   -v "${MLPERF_LLAMA31_RESULTS_PATH}:/mlperf-outputs" \\
@@ -301,7 +308,7 @@ if grep -qE "finished: FAILED|-steps FAILED|Task [0-9].* FAILED" /tmp/llama31_co
   exit 1
 fi
 [ "\${run_rc}" -eq 0 ] || exit "\${run_rc}"
-'$(quick_timeout_suffix)
+'$(quick_timeout_suffix mlperf-llama31)
 EOF
 }
 
@@ -375,7 +382,7 @@ if [[ "${EFFECTIVE_MLPERF_LLAMA2_MODE}" == "smoke-test" ]]; then
 fi
 
 docker pull "${MLPERF_LLAMA2_DOCKER_IMAGE}"
-$(quick_timeout_prefix)docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
+$(quick_timeout_prefix mlperf-llama2)docker run --rm --name mlperf-llama2 --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
   -e HF_TOKEN="\${HF_TOKEN:-}" \\
   -e MLPERF_LLAMA2_MODE="${EFFECTIVE_MLPERF_LLAMA2_MODE}" \\
   -e MLPERF_LLAMA2_PUBLIC_MODEL_ID="${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" \\
@@ -526,7 +533,7 @@ accelerate launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
   \${FA_FLAG} \\
   --seed "\${SEED}" \\
   --lora_target_modules "qkv_proj,o_proj"
-'$(quick_timeout_suffix)
+'$(quick_timeout_suffix mlperf-llama2)
 EOF
 }
 
@@ -680,7 +687,7 @@ export CLEAR_CACHES="${MLPERF_GPT_OSS_CLEAR_CACHES}"
 set -a
 source ./config_H200_1x4x1.sh
 set +a
-$(quick_timeout_prefix)bash ./run_with_docker.sh$(quick_timeout_suffix)
+$(quick_timeout_prefix dev)bash ./run_with_docker.sh$(quick_timeout_suffix dev)
 EOF
 }
 
@@ -696,7 +703,7 @@ set -euo pipefail
 mkdir -p "${MLPERF_FLUX_RESULTS_PATH}"
 cd "${MLPERF_UPSTREAM_DIR}/text_to_image/torchtitan"
 docker build -t "${MLPERF_FLUX_IMAGE}" -f Dockerfile .
-$(quick_timeout_prefix)docker run --rm --gpus all --network=host --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
+$(quick_timeout_prefix mlperf-flux)docker run --rm --name mlperf-flux --gpus all --network=host --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
   -v "${MLPERF_HF_CACHE}:/root/.cache" \\
   -v "${MLPERF_FLUX_DATASET_PATH}:/dataset" \\
   -v "${MLPERF_FLUX_MODEL_PATH}:/models" \\
@@ -721,7 +728,7 @@ NGPU="${MLPERF_GPU_COUNT}" \\
   --encoder.empty_encodings_path=/dataset/empty_encodings \\
   ${flux_quick_args} \\
   --training.seed=${MLPERF_FLUX_SEED}
-'$(quick_timeout_suffix)
+'$(quick_timeout_suffix mlperf-flux)
 EOF
 }
 

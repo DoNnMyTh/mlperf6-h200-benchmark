@@ -88,8 +88,12 @@ MLPERF_QUICK_LLAMA31_STEPS="${MLPERF_QUICK_LLAMA31_STEPS:-1000000}"
 MLPERF_QUICK_GPT_OSS_ITERS="${MLPERF_QUICK_GPT_OSS_ITERS:-1000000}"
 MLPERF_QUICK_LLAMA2_STEPS="${MLPERF_QUICK_LLAMA2_STEPS:-1000000}"
 MLPERF_QUICK_FLUX_STEPS="${MLPERF_QUICK_FLUX_STEPS:-1000000}"
-# A large value that effectively disables periodic eval within the window.
-MLPERF_QUICK_EVAL_DISABLE="${MLPERF_QUICK_EVAL_DISABLE:-999999999}"
+# A large value that effectively disables periodic eval within the window. Use a
+# power of two (2^30): llama31 derives val_check_interval = (eval_every / GBS) /
+# GBS, which lightning requires to be an int or a whole float -- 2^30 stays whole
+# for a power-of-two GBS (e.g. 32 -> 1048576.0), whereas 999999999 produced the
+# fractional 976562.5 that lightning rejected. flux/gpt_oss only need "large".
+MLPERF_QUICK_EVAL_DISABLE="${MLPERF_QUICK_EVAL_DISABLE:-1073741824}"
 
 # Render-time helper: emits a `timeout ...` prefix for the training launch when
 # quick-run is on, otherwise nothing. Used inside the render heredocs via $(...).
@@ -423,7 +427,19 @@ else
   apt-get update -y >/dev/null 2>&1 \\
     && apt-get install -y --no-install-recommends python\${LLAMA2_PYV}-dev >/dev/null 2>&1 \\
     || apt-get install -y --no-install-recommends python3-dev >/dev/null 2>&1 || true
-  TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=32 pip install flash-attn==2.1.0 --no-build-isolation
+  # Non-fatal: this image has no Python.h anywhere (source-built /usr/local
+  # python, no apt python3.12-dev), so the 2.1.0 build cannot succeed here. Let it
+  # try, but do not abort the run -- smoke-test can fall back to no flash-attn.
+  TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=32 pip install flash-attn==2.1.0 --no-build-isolation \\
+    || echo "flash-attn build failed; will run without it"
+fi
+# Use flash-attn only if it actually ended up importable. The HF trainer runs
+# without it (standard SDPA attention) -- slower, fine for a smoke-test/perf run.
+if python3 -c "import flash_attn" >/dev/null 2>&1; then
+  FA_FLAG="--use_flash_attn"
+else
+  echo "WARNING: flash-attn unavailable; running llama2 smoke-test without it"
+  FA_FLAG=""
 fi
 git clone --depth 1 https://github.com/mlperf/logging.git /tmp/mlperf-logging
 pip install -e /tmp/mlperf-logging
@@ -501,7 +517,7 @@ accelerate launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
   --lora_alpha 32 \\
   --lora_dropout 0.1 \\
   --max_steps ${llama2_max_steps} \\
-  --use_flash_attn \\
+  \${FA_FLAG} \\
   --seed "\${SEED}" \\
   --lora_target_modules "qkv_proj,o_proj"
 '$(quick_timeout_suffix)
@@ -525,13 +541,13 @@ echo \"quick-run: capped gpt_oss to ${MLPERF_QUICK_GPT_OSS_ITERS} iters, eval di
 set -euo pipefail
 mkdir -p "${MLPERF_GPT_OSS_RESULTS_PATH}"
 # Megatron builds a per-dataset index/shuffle cache. Without an explicit cache
-# path it writes those "dataset materials" next to the data, i.e. into /data --
-# which here is a reuse symlink to the llama31 C4 corpus and is not writable by
-# this container, so the build aborted with "OSError: ... 0 written / Failed to
-# write dataset materials ... supply a directory to which you have write access
-# via the path_to_cache attribute". Give it a writable cache dir under /results
-# (LOGDIR, bind-mounted rw) instead. Create it on the host so the mount exists.
-mkdir -p "${MLPERF_GPT_OSS_RESULTS_PATH}/dataset_cache"
+# path it writes those "dataset materials" next to the data (/data), which fails
+# with "OSError: ... 0 written / Failed to write dataset materials ... supply a
+# directory ... via the path_to_cache attribute". The bind-mounted /results and
+# /data both live on lustre, which root-squashes the container's root user, so a
+# cache path there still cannot be written (0 bytes written). Point it at the
+# container-local /tmp instead (always writable; the cache is regenerable, so
+# losing it when the --rm container exits is fine).
 cd "${MLPERF_UPSTREAM_DIR}/small_llm_moe_pretraining/primus"
 cat > config_H200_1x4x1.sh <<'CFG'
 #!/bin/bash
@@ -630,14 +646,15 @@ if grep -q 'pip install primus_mllog-0.1.0-py3-none-any.whl' Dockerfile.nvidia; 
   sed -i 's|pip install primus_mllog-0.1.0-py3-none-any.whl|pip install primus_mllog-*-py3-none-any.whl|' Dockerfile.nvidia
   echo "Rewrote primus_mllog wheel install to a version glob in Dockerfile.nvidia"
 fi
-# Point Megatron's dataset index/shuffle cache at the writable /results mount
-# (see the mkdir note above). Inject data_cache_path into the model overrides
-# block of the benchmark config, right after the *_data_path entries, matching
-# their indentation. Idempotent: only added when not already present. The conf
-# is re-cloned each run, so this patch reapplies every time.
+# Point Megatron's dataset index/shuffle cache at container-local /tmp (see the
+# note above; lustre mounts are not writable by the container's squashed root).
+# Inject data_cache_path into the model overrides block of the benchmark config,
+# right after the *_data_path entries, matching their indentation. Idempotent:
+# only added when not already present. The conf is re-cloned each run, so this
+# patch reapplies every time.
 if [ -f conf/gpt_oss_20B-pretrain-nvidia.yaml ] && ! grep -q 'data_cache_path:' conf/gpt_oss_20B-pretrain-nvidia.yaml; then
-  sed -i 's#^\(\s*\)test_data_path:.*#&\n\1data_cache_path: /results/dataset_cache#' conf/gpt_oss_20B-pretrain-nvidia.yaml
-  echo "Injected data_cache_path: /results/dataset_cache into gpt_oss conf"
+  sed -i 's#^\(\s*\)test_data_path:.*#&\n\1data_cache_path: /tmp/gpt_oss_dataset_cache#' conf/gpt_oss_20B-pretrain-nvidia.yaml
+  echo "Injected data_cache_path: /tmp/gpt_oss_dataset_cache into gpt_oss conf"
 fi
 docker build -t "${MLPERF_GPT_OSS_IMAGE}" -f Dockerfile.nvidia .
 export DGXSYSTEM=H200_1x4x1

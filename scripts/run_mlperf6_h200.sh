@@ -512,15 +512,21 @@ if [[ "\${MLPERF_LLAMA2_MODE}" == "local-only" || "\${MLPERF_LLAMA2_MODE}" == "s
     fi
   done
 fi
-if [[ "\${MLPERF_LLAMA2_MODE}" == "smoke-test" ]]; then
-  if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.parquet" ]]; then
-    python3 /repo/scripts/prepare_llama2_lora_smoke_dataset.py \\
-      --dataset-name "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" \\
-      --dataset-config "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" \\
-      --output-dir "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}" \\
-      --train-samples "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES}" \\
-      --validation-samples "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES}"
-  fi
+# Prepare the public smoke dataset whenever the parquet is absent and we are not
+# using official/local assets. Gating on exactly "smoke-test" was fragile: the
+# container sometimes received the unresolved mode "auto" (so this was skipped
+# and the run failed with "dataset parquet missing"). Keying off the missing
+# parquet + non-official/local mode covers smoke-test, auto, and empty.
+if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.parquet" \\
+      && "\${MLPERF_LLAMA2_MODE}" != "official" \\
+      && "\${MLPERF_LLAMA2_MODE}" != "local-only" ]]; then
+  echo "Preparing public smoke dataset (parquet missing, mode=\${MLPERF_LLAMA2_MODE})"
+  python3 /repo/scripts/prepare_llama2_lora_smoke_dataset.py \\
+    --dataset-name "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" \\
+    --dataset-config "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" \\
+    --output-dir "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}" \\
+    --train-samples "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES}" \\
+    --validation-samples "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES}"
 fi
 if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.parquet" ]]; then
   echo "ERROR: dataset parquet missing for resolved mode \${MLPERF_LLAMA2_MODE}" >&2

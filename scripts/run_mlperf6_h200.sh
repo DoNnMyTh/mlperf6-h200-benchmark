@@ -705,6 +705,13 @@ if [ -f conf/gpt_oss_20B-pretrain-nvidia.yaml ]; then
   sed -i '/^[[:space:]]*data_cache_path:/d' conf/gpt_oss_20B-pretrain-nvidia.yaml
   sed -i 's#^\(\s*\)test_data_path:.*#&\n\1data_cache_path: /tmp/gpt_oss_dataset_cache#' conf/gpt_oss_20B-pretrain-nvidia.yaml
   echo "Set data_cache_path: /tmp/gpt_oss_dataset_cache in gpt_oss conf"
+  # The conf suppresses Megatron's per-iteration console log (log_interval:
+  # 99999999), so the only perf signal is MLLOG train_loss with no throughput --
+  # the report cannot score it. Lower log_interval so Megatron emits its standard
+  # "elapsed time per iteration (ms)" + "global batch size" line, which the report
+  # parses into throughput. Harmless to perf; just more log lines.
+  sed -i 's#^\(\s*\)log_interval:.*#\1log_interval: 5#' conf/gpt_oss_20B-pretrain-nvidia.yaml
+  echo "Set log_interval: 5 in gpt_oss conf (so per-iteration throughput is logged)"
 fi
 docker build -t "${MLPERF_GPT_OSS_IMAGE}" -f Dockerfile.nvidia .
 export DGXSYSTEM=H200_1x4x1

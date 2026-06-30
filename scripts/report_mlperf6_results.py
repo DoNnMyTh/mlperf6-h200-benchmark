@@ -28,9 +28,12 @@ STEPTIME_RES = [
     re.compile(r"step[_ ]time['\"]?\s*[:=]\s*" + _NUM),              # generic step_time
     re.compile(r"train_step_timing in s:\s*" + _NUM),               # NeMo (llama31)
 ]
-# When a log reports step time + global batch size but no explicit throughput
-# (the NeMo llama31 format), throughput is derived as global_batch_size / step.
-GBS_RE = re.compile(r"global_batch_size:\s*([0-9]+)")
+# Megatron (gpt_oss) logs "elapsed time per iteration (ms): T" (milliseconds).
+ELAPSED_MS_RE = re.compile(r"elapsed time per iteration \(ms\):\s*" + _NUM)
+# When a log reports step time + batch size but no explicit throughput, derive
+# throughput = batch_size / step. Matches NeMo "global_batch_size:" and Megatron
+# "global batch size:".
+GBS_RE = re.compile(r"global[_ ]batch[_ ]size:\s*([0-9]+)")
 
 
 @dataclass
@@ -66,16 +69,28 @@ def _mean_tail(values: list[float], n: int = 50) -> float | None:
     return sum(tail) / len(tail)
 
 
+def _mean_step_seconds(lines: list[str]) -> float | None:
+    """Mean per-step time in seconds: an explicit step-time (s) if present, else
+    Megatron's elapsed-time-per-iteration (ms) converted to seconds."""
+    step = _mean_tail(_collect(STEPTIME_RES, lines))
+    if step:
+        return step
+    ms = _mean_tail(_collect([ELAPSED_MS_RE], lines))
+    if ms:
+        return ms / 1000.0
+    return None
+
+
 def mean_throughput(lines: list[str] | None) -> float | None:
     """Mean throughput (samples/s) over the last steps. Uses an explicit
-    throughput if present, else derives it from global_batch_size / step_time
-    (the NeMo llama31 format reports step timing + GBS but no throughput)."""
+    throughput if present, else derives it from batch_size / step_time (NeMo
+    reports step timing + GBS; Megatron/gpt_oss reports elapsed-ms + GBS)."""
     if not lines:
         return None
     direct = _mean_tail(_collect(THROUGHPUT_RES, lines))
     if direct:
         return direct
-    step = _mean_tail(_collect(STEPTIME_RES, lines))
+    step = _mean_step_seconds(lines)
     gbs = _collect([GBS_RE], lines)
     if step and step > 0 and gbs:
         return gbs[-1] / step
@@ -88,7 +103,7 @@ def extract_perf(lines: list[str] | None) -> str:
     if not lines:
         return "-"
     thr = mean_throughput(lines)
-    step = _mean_tail(_collect(STEPTIME_RES, lines))
+    step = _mean_step_seconds(lines)
     if thr is None and step is None:
         return "-"
     parts: list[str] = []

@@ -26,7 +26,11 @@ THROUGHPUT_RES = [
 STEPTIME_RES = [
     re.compile(r'"train_step_time"\s*:\s*' + _NUM),                  # flux MLLOG
     re.compile(r"step[_ ]time['\"]?\s*[:=]\s*" + _NUM),              # generic step_time
+    re.compile(r"train_step_timing in s:\s*" + _NUM),               # NeMo (llama31)
 ]
+# When a log reports step time + global batch size but no explicit throughput
+# (the NeMo llama31 format), throughput is derived as global_batch_size / step.
+GBS_RE = re.compile(r"global_batch_size:\s*([0-9]+)")
 
 
 @dataclass
@@ -55,15 +59,27 @@ def _collect(patterns: list[re.Pattern[str]], lines: list[str]) -> list[float]:
     return values
 
 
+def _mean_tail(values: list[float], n: int = 50) -> float | None:
+    if not values:
+        return None
+    tail = values[-n:]
+    return sum(tail) / len(tail)
+
+
 def mean_throughput(lines: list[str] | None) -> float | None:
-    """Mean throughput (samples/s) over the last measured steps (steady state)."""
+    """Mean throughput (samples/s) over the last steps. Uses an explicit
+    throughput if present, else derives it from global_batch_size / step_time
+    (the NeMo llama31 format reports step timing + GBS but no throughput)."""
     if not lines:
         return None
-    thr = _collect(THROUGHPUT_RES, lines)
-    if not thr:
-        return None
-    tail = thr[-50:]
-    return sum(tail) / len(tail)
+    direct = _mean_tail(_collect(THROUGHPUT_RES, lines))
+    if direct:
+        return direct
+    step = _mean_tail(_collect(STEPTIME_RES, lines))
+    gbs = _collect([GBS_RE], lines)
+    if step and step > 0 and gbs:
+        return gbs[-1] / step
+    return None
 
 
 def extract_perf(lines: list[str] | None) -> str:
@@ -71,17 +87,15 @@ def extract_perf(lines: list[str] | None) -> str:
     measured steps (steady state). Returns '-' when no perf numbers are present."""
     if not lines:
         return "-"
-    thr = _collect(THROUGHPUT_RES, lines)
-    step = _collect(STEPTIME_RES, lines)
-    if not thr and not step:
+    thr = mean_throughput(lines)
+    step = _mean_tail(_collect(STEPTIME_RES, lines))
+    if thr is None and step is None:
         return "-"
     parts: list[str] = []
-    if thr:
-        tail = thr[-50:]
-        parts.append(f"~{sum(tail) / len(tail):.1f} samples/s (n={len(thr)})")
-    if step:
-        tail = step[-50:]
-        parts.append(f"step ~{sum(tail) / len(tail):.3f}s")
+    if thr is not None:
+        parts.append(f"~{thr:.2f} samples/s")
+    if step is not None:
+        parts.append(f"step ~{step:.3f}s")
     return ", ".join(parts)
 
 
@@ -205,23 +219,37 @@ def inspect_log(log_path: Path | None, lines: list[str] | None) -> tuple[str, st
     return (status, runtime, notes)
 
 
+def _read_lines(path: Path | None) -> list[str]:
+    if path is None or not path.exists() or not path.is_file():
+        return []
+    try:
+        return path.read_text(encoding="utf-8", errors="replace").splitlines()
+    except OSError:
+        return []
+
+
 def build_reports(env: dict[str, str]) -> list[BenchmarkReport]:
+    # (display name, results dir, ref-samples env key, orchestrator stage-log key)
     rows = [
-        ("Small LLM Pretraining", Path(env["MLPERF_LLAMA31_RESULTS_PATH"]), "MLPERF_LLAMA31_REF_SAMPLES"),
-        ("Llama 2 70B LoRA", Path(env["MLPERF_LLAMA2_RESULTS_PATH"]), "MLPERF_LLAMA2_REF_SAMPLES"),
-        ("GPT-OSS 20B", Path(env["MLPERF_GPT_OSS_RESULTS_PATH"]), "MLPERF_GPT_OSS_REF_SAMPLES"),
-        ("FLUX.1", Path(env["MLPERF_FLUX_RESULTS_PATH"]), "MLPERF_FLUX_REF_SAMPLES"),
+        ("Small LLM Pretraining", Path(env["MLPERF_LLAMA31_RESULTS_PATH"]), "MLPERF_LLAMA31_REF_SAMPLES", "llama31"),
+        ("Llama 2 70B LoRA", Path(env["MLPERF_LLAMA2_RESULTS_PATH"]), "MLPERF_LLAMA2_REF_SAMPLES", "llama2_lora"),
+        ("GPT-OSS 20B", Path(env["MLPERF_GPT_OSS_RESULTS_PATH"]), "MLPERF_GPT_OSS_REF_SAMPLES", "gpt_oss20b"),
+        ("FLUX.1", Path(env["MLPERF_FLUX_RESULTS_PATH"]), "MLPERF_FLUX_REF_SAMPLES", "flux"),
     ]
+    orch_root = env.get("MLPERF_ORCH_ROOT", "")
     reports: list[BenchmarkReport] = []
-    for name, results_dir, ref_key in rows:
+    for name, results_dir, ref_key, stage_key in rows:
         log_path = latest_log_file(results_dir)
-        lines: list[str] | None = None
-        if log_path is not None:
-            try:
-                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-            except OSError:
-                lines = None
-        status, runtime, notes = inspect_log(log_path, lines)
+        # The per-step throughput is streamed to stdout, which the orchestrator
+        # tees to ${MLPERF_ORCH_ROOT}/<key>-run.log -- read that too (it is the
+        # reliable source of perf numbers), plus any log under the results dir.
+        stage_log = Path(orch_root) / f"{stage_key}-run.log" if orch_root else None
+        lines = _read_lines(log_path) + _read_lines(stage_log)
+        if not lines:
+            lines = None
+        # Prefer a log that actually exists for the status/notes; None -> "not-run".
+        present_log = log_path or (stage_log if stage_log and stage_log.exists() else None)
+        status, runtime, notes = inspect_log(present_log, lines)
         try:
             ref_samples = int(env.get(ref_key, "0") or "0")
         except ValueError:

@@ -33,7 +33,7 @@ Options:
                            sustained window (eval disabled) instead of a full
                            convergence run. Captures throughput/step-time, NOT a
                            valid MLPerf submission score.
-  --quick-run-seconds N    Per-benchmark perf window in seconds (default 3600).
+  --quick-run-seconds N    Per-benchmark perf window in seconds (default 300).
                            Implies --quick-run.
   -h, --help               Show this help
 

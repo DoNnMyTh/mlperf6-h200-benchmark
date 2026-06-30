@@ -300,9 +300,13 @@ sed -i "s@exp.run(sequential=True, detach=True)@exp.run(sequential=True, detach=
 # BACKGROUND: wait for the -steps job log to appear, then follow it with tail -F.
 # The host tees our stdout to orchestration/llama31-run.log, so the throughput is
 # captured persistently even when the quick-run timeout later kills the container.
-( for _ in \$(seq 1 240); do
-    JOB_LOGS=\$(find /root/.nemo_run/experiments -type f -path "*-steps/*" 2>/dev/null)
-    if [ -n "\${JOB_LOGS}" ]; then echo "[stream] following nemo_run job logs"; exec tail -n +1 -F \${JOB_LOGS}; fi
+( TAILED=" "; for _ in \$(seq 1 720); do
+    for f in \$(find /root/.nemo_run/experiments -type f -path "*-steps/*" 2>/dev/null); do
+      case "\${TAILED}" in
+        *" \${f} "*) : ;;
+        *) TAILED="\${TAILED}\${f} "; echo "[stream] following \${f}"; tail -n +1 -F "\${f}" 2>/dev/null & ;;
+      esac
+    done
     sleep 5
   done ) &
 LLAMA31_TAILER=\$!

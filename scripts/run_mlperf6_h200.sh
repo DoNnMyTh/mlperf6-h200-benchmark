@@ -95,31 +95,37 @@ MLPERF_QUICK_FLUX_STEPS="${MLPERF_QUICK_FLUX_STEPS:-1000000}"
 # fractional 976562.5 that lightning rejected. flux/gpt_oss only need "large".
 MLPERF_QUICK_EVAL_DISABLE="${MLPERF_QUICK_EVAL_DISABLE:-1073741824}"
 
-# Render-time helper: emits the `timeout ...` prefix for the training launch when
-# quick-run is on (plus a pre-clean of any stale same-named container), otherwise
-# nothing. Pass the container name the launch uses so it can be cleaned up.
+# Render-time helper: prefix for a quick-run launch. Rather than wrap the launch
+# in `timeout` (whose SIGTERM->SIGKILL escalation hits the `docker run` CLI but
+# leaves the CONTAINER running, holding the GPUs), start a background WATCHDOG
+# that force-removes the container by name after exactly the perf window. Removing
+# the container makes the foreground `docker run` exit immediately and frees the
+# GPUs deterministically at the window, regardless of in-container signal
+# handling. Pre-clean any stale same-named container first. Pass the name.
 quick_timeout_prefix() {
   [[ "${MLPERF_QUICK_RUN}" == "1" ]] || return 0
   local cname="${1:-}"
-  [[ -n "${cname}" ]] && printf 'docker rm -f %s >/dev/null 2>&1 || true\n' "${cname}"
-  printf 'timeout --signal=TERM --kill-after=60 %s ' "${MLPERF_QUICK_RUN_SECONDS}"
+  [[ -n "${cname}" ]] || return 0
+  printf 'docker rm -f %s >/dev/null 2>&1 || true\n' "${cname}"
+  printf '( sleep %s; echo "quick-run: %ss window reached, removing %s"; docker rm -f %s >/dev/null 2>&1 || true ) &\n' \
+    "${MLPERF_QUICK_RUN_SECONDS}" "${MLPERF_QUICK_RUN_SECONDS}" "${cname}" "${cname}"
+  # End with "; " (not a newline -- $() strips trailing newlines) so the caller's
+  # `docker run`/`bash run_with_docker.sh` is separated from this assignment.
+  printf 'QUICK_WATCHDOG=$! ; '
 }
-# Render-time helper: trailing handler for the quick-run launch. It (1) captures
-# the exit code, (2) FORCE-REMOVES the container -- timeout SIGKILLs the `docker
-# run` CLI but leaves the container running (holding the GPUs and blocking every
-# later benchmark), so an explicit `docker rm -f` is the only reliable cleanup,
-# (3) treats a timeout kill as success. GNU timeout returns 124, or 137/143 when
-# --kill-after escalates to SIGKILL/SIGTERM on a process that ignores the signal;
-# all three mean "the perf window ended", whereas a real crash exits 1/other.
+# Render-time helper: trailing handler for the quick-run launch. Capture the exit
+# code, stop the watchdog, force-remove the container (belt-and-suspenders), and
+# treat a watchdog/timeout kill as success. When the watchdog removes the
+# container the foreground launch exits 137 (SIGKILL); a real crash exits 1/other.
 quick_timeout_suffix() {
   [[ "${MLPERF_QUICK_RUN}" == "1" ]] || return 0
   local cname="${1:-}"
   printf ' || quick_ec=$?\n'
+  printf 'kill "${QUICK_WATCHDOG}" 2>/dev/null || true\n'
   [[ -n "${cname}" ]] && printf 'docker rm -f %s >/dev/null 2>&1 || true\n' "${cname}"
   cat <<'SUF'
 case "${quick_ec:-0}" in
-  0) : ;;
-  124|137|143) echo "quick-run: perf window reached (container stopped); treating as success" ;;
+  0|124|137|143) echo "quick-run: perf window reached (container stopped); treating as success" ;;
   *) exit "${quick_ec}" ;;
 esac
 SUF

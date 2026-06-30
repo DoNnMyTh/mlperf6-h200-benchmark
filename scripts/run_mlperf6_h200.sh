@@ -612,7 +612,10 @@ export EXP=/workspace/code/conf/gpt_oss_20B-pretrain-nvidia.yaml
 export DATA_PATH=/data
 export MODEL=/model
 
-export PRIMUS_MICRO_BATCH_SIZE=2
+# micro-batch 2 OOMs by ~60 MiB on the 140 GiB H200 (133 GiB already resident);
+# halving the micro-batch frees several GiB of activation memory so the 20B MoE
+# fits. Throughput is still a valid hardware measurement at mbs=1.
+export PRIMUS_MICRO_BATCH_SIZE=1
 export PRIMUS_GLOBAL_BATCH_SIZE=16
 export PRIMUS_LR=4.0e-4
 export PRIMUS_MIN_LR=4.0e-5

@@ -155,22 +155,34 @@ render_llama31() {
 set -euo pipefail
 mkdir -p "${MLPERF_LLAMA31_RESULTS_PATH}" "${MLPERF_LLAMA31_CHECKPOINT_PATH}" "${MLPERF_LLAMA31_INDEX_PATH}"
 cd "${MLPERF_UPSTREAM_DIR}/small_llm_pretraining/nemo"
-# pretrain_llama31.py does 'import wandb' unconditionally, and TWO separate
-# Python environments import it -- both must have wandb or the run aborts with
-# ModuleNotFoundError:
-#   1. the HOST launcher -- run_llama31.sh invokes 'python3 pretrain_llama31.py'
-#      on the host to submit the job (submitit), so the host interpreter imports
-#      wandb before anything containerized runs. This is what actually failed:
-#      the traceback path was the host work dir, not /workspace in the image.
-#   2. the in-container training process, via the same top-level import.
-# Cover both: the idempotent Dockerfile append handles (2); the host pip install
-# (just before launch, below) handles (1). WANDB_MODE=offline so wandb.init
-# needs no API key in either environment.
+# pretrain_llama31.py imports the full NeMo stack at module top -- wandb,
+# lightning, and (lines 23-31) nemo.collections, nemo.lightning, nemo_run plus a
+# local callbacks module. Without --run_slurm it builds a run.LocalExecutor()
+# and launches training via torchrun, i.e. it trains IN-PROCESS in whatever
+# environment runs the launcher. The bare host has none of that stack (the run
+# failed first at 'import wandb', then 'import lightning', with nemo next), and
+# installing NeMo + TransformerEngine + Megatron on the host is not viable. The
+# built image already contains the entire stack, so run the launcher INSIDE the
+# image with the GPUs attached. LocalExecutor spawns no nested container in local
+# mode, so no docker socket is needed. Keep the idempotent Dockerfile wandb
+# install so the in-image interpreter has wandb; WANDB_MODE=offline needs no key.
 if ! grep -q 'pip install wandb' Dockerfile.h200; then
   printf '\nRUN pip install --no-cache-dir wandb\nENV WANDB_MODE=offline\n' >> Dockerfile.h200
   echo "Added wandb install + offline mode to Dockerfile.h200"
 fi
 docker build -t "${MLPERF_LLAMA31_IMAGE}" -f Dockerfile.h200 .
+# Run the launcher inside the freshly built image. Every benchmark path lives
+# under /scratch on this node, so a single bind mount makes all the absolute host
+# paths below resolve identically inside the container; mount the results dir at
+# /mlperf-outputs too so MLLog output persists past the --rm container.
+docker run --rm --gpus all --ipc=host --network host \\
+  --ulimit memlock=-1 --ulimit stack=67108864 \\
+  -v /scratch:/scratch \\
+  -v "${MLPERF_LLAMA31_RESULTS_PATH}:/mlperf-outputs" \\
+  -w "${MLPERF_UPSTREAM_DIR}/small_llm_pretraining/nemo" \\
+  "${MLPERF_LLAMA31_IMAGE}" \\
+  bash -lc '
+set -euo pipefail
 source ./config_H200_1x8x1_8b.sh
 export WANDB_MODE="\${WANDB_MODE:-offline}"
 export USER="\${USER:-local}"
@@ -189,24 +201,11 @@ export CONTINUAL_CKPT="${MLPERF_LLAMA31_CHECKPOINT_PATH}"
 export TMP_NPY_INDEX="${MLPERF_LLAMA31_INDEX_PATH}"
 export GBS="${MLPERF_LLAMA31_GBS}"
 export MBS="${MLPERF_LLAMA31_MBS}"
-export CUDA_HOME="${MLPERF_CUDA_HOME}"
-# Upstream run_llama31.sh runs under 'set -e' and does a host-side
-# 'mkdir /mlperf-outputs', which assumes root and aborts the whole run for a
-# non-root user ("Permission denied"). On the host that directory is vestigial:
-# /mlperf-outputs is only a container bind-mount target (mapped from JOB_DIR in
-# MOUNTS), and pretrain_llama31.py never reads it. So best-effort create it
-# (root/sudo when available), then make the upstream mkdir non-fatal so the run
-# proceeds without root; the container still gets /mlperf-outputs via the mount.
-mkdir -p /mlperf-outputs 2>/dev/null || sudo -n mkdir -p /mlperf-outputs 2>/dev/null || true
-sed -i 's@mkdir /mlperf-outputs; fi@mkdir -p /mlperf-outputs 2>/dev/null || true; fi@' run_llama31.sh
-# Install wandb into the HOST interpreter that runs pretrain_llama31.py (see the
-# note above -- the submitit launcher imports wandb on the host). Try a plain
-# install, then user-site, then break-system-packages, to cover a normal host,
-# a PEP 668 externally-managed host, and a venv host respectively.
-python3 -m pip install --no-cache-dir --quiet wandb \\
-  || python3 -m pip install --no-cache-dir --quiet --user wandb \\
-  || python3 -m pip install --no-cache-dir --quiet --break-system-packages wandb
+# In-container we are root, so the upstream "mkdir /mlperf-outputs" succeeds, but
+# keep the guard non-fatal for safety (the dir is also bind-mounted above).
+sed -i "s@mkdir /mlperf-outputs; fi@mkdir -p /mlperf-outputs 2>/dev/null || true; fi@" run_llama31.sh
 bash ./run_llama31.sh
+'
 EOF
 }
 
@@ -315,11 +314,19 @@ pip install -r requirements.txt
 if python3 -c "import flash_attn" >/dev/null 2>&1; then
   echo "Using flash-attn already present in image: \$(python3 -c "import flash_attn, sys; sys.stdout.write(flash_attn.__version__)")"
 else
-  echo "flash-attn not in image; installing dev headers and building from source for sm_90"
+  echo "flash-attn not in image; building from source for sm_90"
+  # This image keeps python under /usr/local (a source build), so the base distro
+  # has no python3.12-dev package to apt-install -- that is why the previous
+  # header step silently did nothing and the build still failed on Python.h.
+  # Point the compiler at the interpreter OWN headers via python3-config (e.g.
+  # /usr/local/include/python3.12, where this python keeps Python.h), and keep
+  # apt as a backup for stock distro-python images.
+  PY_INC=\$(python3-config --includes 2>/dev/null | sed "s/-I//g")
+  export CPATH="\${PY_INC// /:}:\${CPATH:-}"
   LLAMA2_PYV=\$(python3 -V 2>&1 | cut -d" " -f2 | cut -d. -f1,2)
-  apt-get update -y || true
-  apt-get install -y --no-install-recommends python\${LLAMA2_PYV}-dev \\
-    || apt-get install -y --no-install-recommends python3-dev || true
+  apt-get update -y >/dev/null 2>&1 \\
+    && apt-get install -y --no-install-recommends python\${LLAMA2_PYV}-dev >/dev/null 2>&1 \\
+    || apt-get install -y --no-install-recommends python3-dev >/dev/null 2>&1 || true
   TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=32 pip install flash-attn==2.1.0 --no-build-isolation
 fi
 git clone --depth 1 https://github.com/mlperf/logging.git /tmp/mlperf-logging
@@ -409,6 +416,14 @@ render_gpt_oss20b() {
   cat <<EOF
 set -euo pipefail
 mkdir -p "${MLPERF_GPT_OSS_RESULTS_PATH}"
+# Megatron builds a per-dataset index/shuffle cache. Without an explicit cache
+# path it writes those "dataset materials" next to the data, i.e. into /data --
+# which here is a reuse symlink to the llama31 C4 corpus and is not writable by
+# this container, so the build aborted with "OSError: ... 0 written / Failed to
+# write dataset materials ... supply a directory to which you have write access
+# via the path_to_cache attribute". Give it a writable cache dir under /results
+# (LOGDIR, bind-mounted rw) instead. Create it on the host so the mount exists.
+mkdir -p "${MLPERF_GPT_OSS_RESULTS_PATH}/dataset_cache"
 cd "${MLPERF_UPSTREAM_DIR}/small_llm_moe_pretraining/primus"
 cat > config_H200_1x4x1.sh <<'CFG'
 #!/bin/bash
@@ -499,6 +514,15 @@ fi
 if grep -q 'pip install primus_mllog-0.1.0-py3-none-any.whl' Dockerfile.nvidia; then
   sed -i 's|pip install primus_mllog-0.1.0-py3-none-any.whl|pip install primus_mllog-*-py3-none-any.whl|' Dockerfile.nvidia
   echo "Rewrote primus_mllog wheel install to a version glob in Dockerfile.nvidia"
+fi
+# Point Megatron's dataset index/shuffle cache at the writable /results mount
+# (see the mkdir note above). Inject data_cache_path into the model overrides
+# block of the benchmark config, right after the *_data_path entries, matching
+# their indentation. Idempotent: only added when not already present. The conf
+# is re-cloned each run, so this patch reapplies every time.
+if [ -f conf/gpt_oss_20B-pretrain-nvidia.yaml ] && ! grep -q 'data_cache_path:' conf/gpt_oss_20B-pretrain-nvidia.yaml; then
+  sed -i 's#^\(\s*\)test_data_path:.*#&\n\1data_cache_path: /results/dataset_cache#' conf/gpt_oss_20B-pretrain-nvidia.yaml
+  echo "Injected data_cache_path: /results/dataset_cache into gpt_oss conf"
 fi
 docker build -t "${MLPERF_GPT_OSS_IMAGE}" -f Dockerfile.nvidia .
 export DGXSYSTEM=H200_1x4x1

@@ -292,17 +292,27 @@ sed -i "s@mkdir /mlperf-outputs; fi@mkdir -p /mlperf-outputs 2>/dev/null || true
 # detach=False so the job logs stream to stdout (and into the orchestrator log
 # and the false-success grep below). Idempotent.
 sed -i "s@exp.run(sequential=True, detach=True)@exp.run(sequential=True, detach=False)@" pretrain_llama31.py
-# nemo_run/LocalExecutor swallows task failures and exits 0, and writes the real
-# training logs into its own experiment dir rather than stdout -- so the
-# orchestrator marked a FAILED experiment as success and its console looked
-# empty while the GPU was busy. Capture the console, dump the experiment logs so
-# the actual error is visible, and fail the stage when the experiment FAILED.
+# nemo_run LocalExecutor runs the training job with log=False: it writes the
+# real per-step logs (global_batch_size / train_step_timing -> the throughput we
+# need) into its experiment dir under /root/.nemo_run/.../-steps/, NOT to stdout.
+# So the orchestrator stage log (and the report) never saw them, and they were
+# lost when the --rm container exited. Stream that job log to stdout in the
+# BACKGROUND: wait for the -steps job log to appear, then follow it with tail -F.
+# The host tees our stdout to orchestration/llama31-run.log, so the throughput is
+# captured persistently even when the quick-run timeout later kills the container.
+( for _ in \$(seq 1 240); do
+    JOB_LOGS=\$(find /root/.nemo_run/experiments -type f -path "*-steps/*" 2>/dev/null)
+    if [ -n "\${JOB_LOGS}" ]; then echo "[stream] following nemo_run job logs"; exec tail -n +1 -F \${JOB_LOGS}; fi
+    sleep 5
+  done ) &
+LLAMA31_TAILER=\$!
 set +e
 bash ./run_llama31.sh 2>&1 | tee /tmp/llama31_console.log
 run_rc=\${PIPESTATUS[0]}
 set -e
+kill "\${LLAMA31_TAILER}" 2>/dev/null || true
 echo "===== nemo_run experiment logs (tail) ====="
-find /root/.nemo_run -type f -name "*.log" 2>/dev/null | while read -r f; do echo "--- \$f ---"; tail -n 120 "\$f"; done || true
+find /root/.nemo_run -type f \\( -name "*.log" -o -path "*-steps/*" \\) 2>/dev/null | while read -r f; do echo "--- \$f ---"; tail -n 200 "\$f"; done || true
 if grep -qE "finished: FAILED|-steps FAILED|Task [0-9].* FAILED" /tmp/llama31_console.log; then
   echo "ERROR: llama31 nemo_run experiment reported FAILED (LocalExecutor exited 0 but the task failed)"
   exit 1

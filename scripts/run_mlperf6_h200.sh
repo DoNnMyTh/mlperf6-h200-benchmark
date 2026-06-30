@@ -521,12 +521,30 @@ if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.pa
       && "\${MLPERF_LLAMA2_MODE}" != "official" \\
       && "\${MLPERF_LLAMA2_MODE}" != "local-only" ]]; then
   echo "Preparing public smoke dataset (parquet missing, mode=\${MLPERF_LLAMA2_MODE})"
-  python3 /repo/scripts/prepare_llama2_lora_smoke_dataset.py \\
-    --dataset-name "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" \\
-    --dataset-config "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" \\
-    --output-dir "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}" \\
-    --train-samples "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES}" \\
-    --validation-samples "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES}"
+  # Inline the prep so it never depends on a /repo helper file being present on
+  # the host (a partial checkout left /repo/scripts/prepare_..._smoke_dataset.py
+  # missing). Reads the smoke params from the env already forwarded into the
+  # container. No single quotes and no dollar signs so it survives bash -lc.
+  cat > /tmp/prep_llama2_smoke.py <<PYEOF
+import os
+from datasets import load_dataset
+out = "/workspace/dataset/" + os.environ["LLAMA2_DATASET_SUBDIR"]
+os.makedirs(out, exist_ok=True)
+ds = load_dataset(os.environ["MLPERF_LLAMA2_SMOKE_DATASET_NAME"], os.environ["MLPERF_LLAMA2_SMOKE_DATASET_CONFIG"])
+def _prep(split, n):
+    n = int(n)
+    if n > 0:
+        split = split.select(range(min(n, len(split))))
+    keep = {"input", "output"}
+    drop = [c for c in split.column_names if c not in keep]
+    if drop:
+        split = split.remove_columns(drop)
+    return split
+_prep(ds["train"], os.environ.get("MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES", "128")).to_parquet(out + "/train-00000-of-00001.parquet")
+_prep(ds["validation"], os.environ.get("MLPERF_LLAMA2_SMOKE_VAL_SAMPLES", "32")).to_parquet(out + "/validation-00000-of-00001.parquet")
+print("smoke dataset prepared at " + out)
+PYEOF
+  python3 /tmp/prep_llama2_smoke.py
 fi
 if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.parquet" ]]; then
   echo "ERROR: dataset parquet missing for resolved mode \${MLPERF_LLAMA2_MODE}" >&2

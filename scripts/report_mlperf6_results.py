@@ -38,6 +38,7 @@ class BenchmarkReport:
     status: str
     notes: str
     perf: str
+    projected: str
 
 
 def _collect(patterns: list[re.Pattern[str]], lines: list[str]) -> list[float]:
@@ -52,6 +53,17 @@ def _collect(patterns: list[re.Pattern[str]], lines: list[str]) -> list[float]:
                     pass
                 break
     return values
+
+
+def mean_throughput(lines: list[str] | None) -> float | None:
+    """Mean throughput (samples/s) over the last measured steps (steady state)."""
+    if not lines:
+        return None
+    thr = _collect(THROUGHPUT_RES, lines)
+    if not thr:
+        return None
+    tail = thr[-50:]
+    return sum(tail) / len(tail)
 
 
 def extract_perf(lines: list[str] | None) -> str:
@@ -71,6 +83,21 @@ def extract_perf(lines: list[str] | None) -> str:
         tail = step[-50:]
         parts.append(f"step ~{sum(tail) / len(tail):.3f}s")
     return ", ".join(parts)
+
+
+def project_time_to_train(ref_samples: int, throughput: float | None) -> str:
+    """Projected MLPerf-style score = REF_SAMPLES / measured throughput. An
+    estimate, not an official 10-run convergence measurement."""
+    if ref_samples <= 0:
+        return "(set ref samples)"
+    if not throughput or throughput <= 0:
+        return "(no throughput yet)"
+    seconds = ref_samples / throughput
+    if seconds < 3600:
+        return f"~{seconds / 60:.0f} min (est.)"
+    if seconds < 48 * 3600:
+        return f"~{seconds / 3600:.1f} h (est.)"
+    return f"~{seconds / 86400:.1f} d (est.)"
 
 
 @dataclass
@@ -180,13 +207,13 @@ def inspect_log(log_path: Path | None, lines: list[str] | None) -> tuple[str, st
 
 def build_reports(env: dict[str, str]) -> list[BenchmarkReport]:
     rows = [
-        ("Small LLM Pretraining", Path(env["MLPERF_LLAMA31_RESULTS_PATH"])),
-        ("Llama 2 70B LoRA", Path(env["MLPERF_LLAMA2_RESULTS_PATH"])),
-        ("GPT-OSS 20B", Path(env["MLPERF_GPT_OSS_RESULTS_PATH"])),
-        ("FLUX.1", Path(env["MLPERF_FLUX_RESULTS_PATH"])),
+        ("Small LLM Pretraining", Path(env["MLPERF_LLAMA31_RESULTS_PATH"]), "MLPERF_LLAMA31_REF_SAMPLES"),
+        ("Llama 2 70B LoRA", Path(env["MLPERF_LLAMA2_RESULTS_PATH"]), "MLPERF_LLAMA2_REF_SAMPLES"),
+        ("GPT-OSS 20B", Path(env["MLPERF_GPT_OSS_RESULTS_PATH"]), "MLPERF_GPT_OSS_REF_SAMPLES"),
+        ("FLUX.1", Path(env["MLPERF_FLUX_RESULTS_PATH"]), "MLPERF_FLUX_REF_SAMPLES"),
     ]
     reports: list[BenchmarkReport] = []
-    for name, results_dir in rows:
+    for name, results_dir, ref_key in rows:
         log_path = latest_log_file(results_dir)
         lines: list[str] | None = None
         if log_path is not None:
@@ -195,6 +222,10 @@ def build_reports(env: dict[str, str]) -> list[BenchmarkReport]:
             except OSError:
                 lines = None
         status, runtime, notes = inspect_log(log_path, lines)
+        try:
+            ref_samples = int(env.get(ref_key, "0") or "0")
+        except ValueError:
+            ref_samples = 0
         reports.append(
             BenchmarkReport(
                 name=name,
@@ -204,6 +235,7 @@ def build_reports(env: dict[str, str]) -> list[BenchmarkReport]:
                 status=status,
                 notes=notes,
                 perf=extract_perf(lines),
+                projected=project_time_to_train(ref_samples, mean_throughput(lines)),
             )
         )
     return reports
@@ -250,14 +282,14 @@ def render_markdown(
         "",
         "## Benchmark Summary",
         "",
-        "| Benchmark | Status | Runtime (s) | Hardware Perf | Results Dir | Notes |",
-        "| --- | --- | ---: | --- | --- | --- |",
+        "| Benchmark | Status | Runtime (s) | Hardware Perf | Projected TTT (est.) | Results Dir | Notes |",
+        "| --- | --- | ---: | --- | --- | --- | --- |",
     ]
 
     for report in reports:
         lines.append(
             f"| {report.name} | {report.status} | {report.runtime_seconds} | "
-            f"{report.perf} | `{report.results_dir}` | {report.notes} |"
+            f"{report.perf} | {report.projected} | `{report.results_dir}` | {report.notes} |"
         )
 
     if pipeline_rows:
@@ -277,6 +309,18 @@ def render_markdown(
 
     lines.extend(
         [
+            "",
+            "## Notes on Projected TTT (est.)",
+            "",
+            "- *Projected time-to-train* = `REF_SAMPLES / measured throughput` — an "
+            "estimate of the MLPerf score this hardware would reach, derived from a "
+            "short perf window (e.g. `--quick-run`). It assumes steady-state "
+            "throughput and ignores convergence run-to-run variance.",
+            "- It is NOT an official score: a compliant MLPerf time-to-train needs 10 "
+            "convergence runs (drop fastest/slowest, average the middle 8) plus the "
+            "RCP checker. Use this only for hardware comparison, not submission.",
+            "- `REF_SAMPLES` per benchmark are set in the env file "
+            "(`MLPERF_*_REF_SAMPLES`); override with official RCP values as available.",
             "",
             "## Next Checks",
             "",

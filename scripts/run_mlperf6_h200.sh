@@ -268,11 +268,29 @@ export CONTINUAL_CKPT="${MLPERF_LLAMA31_CHECKPOINT_PATH}"
 export TMP_NPY_INDEX="${MLPERF_LLAMA31_INDEX_PATH}"
 export GBS="${MLPERF_LLAMA31_GBS}"
 export MBS="${MLPERF_LLAMA31_MBS}"
+# The 8B run sits near the 140 GiB H200 limit (~130 GiB observed); reduce
+# allocator fragmentation to lower the OOM risk.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 ${llama31_quick_exports}
 # In-container we are root, so the upstream "mkdir /mlperf-outputs" succeeds, but
 # keep the guard non-fatal for safety (the dir is also bind-mounted above).
 sed -i "s@mkdir /mlperf-outputs; fi@mkdir -p /mlperf-outputs 2>/dev/null || true; fi@" run_llama31.sh
-bash ./run_llama31.sh
+# nemo_run/LocalExecutor swallows task failures and exits 0, and writes the real
+# training logs into its own experiment dir rather than stdout -- so the
+# orchestrator marked a FAILED experiment as success and its console looked
+# empty while the GPU was busy. Capture the console, dump the experiment logs so
+# the actual error is visible, and fail the stage when the experiment FAILED.
+set +e
+bash ./run_llama31.sh 2>&1 | tee /tmp/llama31_console.log
+run_rc=\${PIPESTATUS[0]}
+set -e
+echo "===== nemo_run experiment logs (tail) ====="
+find /root/.nemo_run -type f -name "*.log" 2>/dev/null | while read -r f; do echo "--- \$f ---"; tail -n 120 "\$f"; done || true
+if grep -qE "finished: FAILED|-steps FAILED|Task [0-9].* FAILED" /tmp/llama31_console.log; then
+  echo "ERROR: llama31 nemo_run experiment reported FAILED (LocalExecutor exited 0 but the task failed)"
+  exit 1
+fi
+[ "\${run_rc}" -eq 0 ] || exit "\${run_rc}"
 '$(quick_timeout_suffix)
 EOF
 }
@@ -397,7 +415,9 @@ else
   # Point the compiler at the interpreter OWN headers via python3-config (e.g.
   # /usr/local/include/python3.12, where this python keeps Python.h), and keep
   # apt as a backup for stock distro-python images.
-  PY_INC=\$(python3-config --includes 2>/dev/null | sed "s/-I//g")
+  # Guard with || true: under set -euo pipefail a missing python3-config (or any
+  # pipe failure here) would otherwise abort the whole llama2 run at this line.
+  PY_INC=\$(python3-config --includes 2>/dev/null | sed "s/-I//g" || true)
   export CPATH="\${PY_INC// /:}:\${CPATH:-}"
   LLAMA2_PYV=\$(python3 -V 2>&1 | cut -d" " -f2 | cut -d. -f1,2)
   apt-get update -y >/dev/null 2>&1 \\
@@ -533,6 +553,12 @@ export MASTER_PORT=29501
 # is passed through. Verified against the upstream run_with_docker.sh.
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_DEBUG=WARN
+# The 20B MoE runs right at the 140 GiB H200 limit and OOM'd in the expert
+# forward (~131 GiB allocated, only ~389 MiB free). expandable_segments recovers
+# reserved-but-unallocated fragmentation, which the allocator itself recommends.
+# NOTE: this is a thin margin -- if it still OOMs, the real fix is a distributed
+# optimizer / more model parallelism (TP>1) to shard optimizer state.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 
 export PRIMUS_PATH=/workspace/deps/Primus
 export PYTHONPATH="\${PRIMUS_PATH}:\${PRIMUS_PATH}/third_party/Megatron-LM:\${PYTHONPATH:-}"
@@ -657,6 +683,10 @@ $(quick_timeout_prefix)docker run --rm --gpus all --network=host --ipc=host --ul
   "${MLPERF_FLUX_IMAGE}" \\
   bash -lc '
 set -euo pipefail
+# flux trained ~110 steps then died with no traceback (a SIGKILL, consistent with
+# the host/GPU running out of memory near the 140 GiB limit). Reduce allocator
+# fragmentation so it does not creep into an OOM kill mid-run.
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
 pip install -r requirements-mlperf.txt
 pip install -r torchtitan/experiments/flux/requirements-flux.txt
 CONFIG_FILE=./torchtitan/experiments/flux/train_configs/flux_schnell_mlperf_preprocessed.toml \\

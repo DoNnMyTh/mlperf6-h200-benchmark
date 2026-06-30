@@ -526,13 +526,14 @@ if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.pa
   # missing). Reads the smoke params from the env already forwarded into the
   # container. No single quotes and no dollar signs so it survives bash -lc.
   cat > /tmp/prep_llama2_smoke.py <<PYEOF
-import os
+import sys
 from datasets import load_dataset
-out = "/workspace/dataset/" + os.environ["LLAMA2_DATASET_SUBDIR"]
+name, config, out = sys.argv[1], sys.argv[2], sys.argv[3]
+ntr, nval = int(sys.argv[4]), int(sys.argv[5])
+import os
 os.makedirs(out, exist_ok=True)
-ds = load_dataset(os.environ["MLPERF_LLAMA2_SMOKE_DATASET_NAME"], os.environ["MLPERF_LLAMA2_SMOKE_DATASET_CONFIG"])
+ds = load_dataset(name, config)
 def _prep(split, n):
-    n = int(n)
     if n > 0:
         split = split.select(range(min(n, len(split))))
     keep = {"input", "output"}
@@ -540,11 +541,13 @@ def _prep(split, n):
     if drop:
         split = split.remove_columns(drop)
     return split
-_prep(ds["train"], os.environ.get("MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES", "128")).to_parquet(out + "/train-00000-of-00001.parquet")
-_prep(ds["validation"], os.environ.get("MLPERF_LLAMA2_SMOKE_VAL_SAMPLES", "32")).to_parquet(out + "/validation-00000-of-00001.parquet")
+_prep(ds["train"], ntr).to_parquet(out + "/train-00000-of-00001.parquet")
+_prep(ds["validation"], nval).to_parquet(out + "/validation-00000-of-00001.parquet")
 print("smoke dataset prepared at " + out)
 PYEOF
-  python3 /tmp/prep_llama2_smoke.py
+  # Pass params as argv (bash expands them, including the non-exported shell var
+  # LLAMA2_DATASET_SUBDIR that python os.environ could not see -> the KeyError).
+  python3 /tmp/prep_llama2_smoke.py "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}" "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES:-128}" "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES:-32}"
 fi
 if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.parquet" ]]; then
   echo "ERROR: dataset parquet missing for resolved mode \${MLPERF_LLAMA2_MODE}" >&2

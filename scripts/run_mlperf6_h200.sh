@@ -431,7 +431,26 @@ export HF_HUB_DISABLE_XET=1
 # lustre mount with "[Errno 14] Bad address" mid-download of the 70B shards.
 # Disable it so writes go through plain Python http_get, which resumes reliably.
 export HF_HUB_ENABLE_HF_TRANSFER=0
+# huggingface caches downloads (datasets via load_dataset, model via
+# huggingface-cli) under HF_HOME (default /root/.cache, bind-mounted from lustre
+# and thus not writable by the squashed root). Point it at container-local /tmp
+# so dataset prep and model download can cache.
+export HF_HOME=/tmp/hf_home
 echo "Resolved llama2_lora mode inside container: \${MLPERF_LLAMA2_MODE}"
+# /workspace/dataset and /models are lustre bind mounts; the node root-squashes
+# the container root user, so writes there fail with "Permission denied". Assets
+# we GENERATE/DOWNLOAD must go to container-local /tmp; only official mode reads the
+# mounted assets in place. Data dir is /tmp only when we prep it (non
+# official/local); model dir is /tmp whenever we download it (non official).
+LLAMA2_DATA_DIR="/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}"
+LLAMA2_MODEL_DIR="/models/\${LLAMA2_MODEL_SUBDIR}"
+if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
+  LLAMA2_MODEL_DIR="/tmp/llama2_model/\${LLAMA2_MODEL_SUBDIR}"
+  if [[ "\${MLPERF_LLAMA2_MODE}" != "local-only" ]]; then
+    LLAMA2_DATA_DIR="/tmp/llama2_data/\${LLAMA2_DATASET_SUBDIR}"
+  fi
+fi
+echo "llama2 data dir: \${LLAMA2_DATA_DIR} | model dir: \${LLAMA2_MODEL_DIR}"
 pip install -r requirements.txt
 # flash-attn: the upstream step force-builds 2.1.0 from source, but 2.1.0 (Sep
 # 2023) predates CUDA 13 / Hopper sm_90 and will not compile on this H200 node
@@ -494,7 +513,7 @@ if [[ "\${MLPERF_LLAMA2_MODE}" == "local-only" || "\${MLPERF_LLAMA2_MODE}" == "s
   # this completes the remaining shards across attempts.
   model_download_ok=0
   for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    if huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "/models/\${LLAMA2_MODEL_SUBDIR}" --max-workers 1; then
+    if huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "\${LLAMA2_MODEL_DIR}" --max-workers 1; then
       model_download_ok=1
       break
     fi
@@ -506,8 +525,8 @@ if [[ "\${MLPERF_LLAMA2_MODE}" == "local-only" || "\${MLPERF_LLAMA2_MODE}" == "s
     exit 1
   fi
   for required in config.json modeling_llama.py model.safetensors.index.json; do
-    if [[ ! -f "/models/\${LLAMA2_MODEL_SUBDIR}/\${required}" ]]; then
-      echo "ERROR: required model file still missing after download: /models/\${LLAMA2_MODEL_SUBDIR}/\${required}" >&2
+    if [[ ! -f "\${LLAMA2_MODEL_DIR}/\${required}" ]]; then
+      echo "ERROR: required model file still missing after download: \${LLAMA2_MODEL_DIR}/\${required}" >&2
       exit 1
     fi
   done
@@ -517,7 +536,7 @@ fi
 # container sometimes received the unresolved mode "auto" (so this was skipped
 # and the run failed with "dataset parquet missing"). Keying off the missing
 # parquet + non-official/local mode covers smoke-test, auto, and empty.
-if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.parquet" \\
+if [[ ! -f "\${LLAMA2_DATA_DIR}/train-00000-of-00001.parquet" \\
       && "\${MLPERF_LLAMA2_MODE}" != "official" \\
       && "\${MLPERF_LLAMA2_MODE}" != "local-only" ]]; then
   echo "Preparing public smoke dataset (parquet missing, mode=\${MLPERF_LLAMA2_MODE})"
@@ -532,7 +551,7 @@ name, config, out = sys.argv[1], sys.argv[2], sys.argv[3]
 ntr, nval = int(sys.argv[4]), int(sys.argv[5])
 import os
 os.makedirs(out, exist_ok=True)
-ds = load_dataset(name, config)
+ds = load_dataset(name, config, trust_remote_code=True)
 def _prep(split, n):
     if n > 0:
         split = split.select(range(min(n, len(split))))
@@ -547,20 +566,20 @@ print("smoke dataset prepared at " + out)
 PYEOF
   # Pass params as argv (bash expands them, including the non-exported shell var
   # LLAMA2_DATASET_SUBDIR that python os.environ could not see -> the KeyError).
-  python3 /tmp/prep_llama2_smoke.py "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}" "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES:-128}" "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES:-32}"
+  python3 /tmp/prep_llama2_smoke.py "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" "\${LLAMA2_DATA_DIR}" "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES:-128}" "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES:-32}"
 fi
-if [[ ! -f "/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}/train-00000-of-00001.parquet" ]]; then
+if [[ ! -f "\${LLAMA2_DATA_DIR}/train-00000-of-00001.parquet" ]]; then
   echo "ERROR: dataset parquet missing for resolved mode \${MLPERF_LLAMA2_MODE}" >&2
   exit 1
 fi
-if [[ ! -d "/models/\${LLAMA2_MODEL_SUBDIR}" ]]; then
+if [[ ! -d "\${LLAMA2_MODEL_DIR}" ]]; then
   echo "ERROR: model directory missing for resolved mode \${MLPERF_LLAMA2_MODE}" >&2
   exit 1
 fi
 SEED="${MLPERF_LLAMA2_SEED}"
 accelerate launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
-  --dataset_path "./dataset/\${LLAMA2_DATASET_SUBDIR}" \\
-  --model_path "/models/\${LLAMA2_MODEL_SUBDIR}" \\
+  --dataset_path "\${LLAMA2_DATA_DIR}" \\
+  --model_path "\${LLAMA2_MODEL_DIR}" \\
   --max_seq_len 8192 \\
   --bf16 True \\
   --logging_steps 24 \\

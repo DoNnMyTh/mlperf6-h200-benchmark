@@ -468,6 +468,9 @@ else
   echo "WARNING: flash-attn unavailable; running llama2 smoke-test without it"
   FA_FLAG=""
 fi
+# Idempotent: a previous attempt in a reused image layer can leave this dir, so
+# git clone fails with "destination path already exists". Remove it first.
+rm -rf /tmp/mlperf-logging
 git clone --depth 1 https://github.com/mlperf/logging.git /tmp/mlperf-logging
 pip install -e /tmp/mlperf-logging
 if [[ -n "\${HF_TOKEN:-}" ]]; then
@@ -679,9 +682,14 @@ fi
 # right after the *_data_path entries, matching their indentation. Idempotent:
 # only added when not already present. The conf is re-cloned each run, so this
 # patch reapplies every time.
-if [ -f conf/gpt_oss_20B-pretrain-nvidia.yaml ] && ! grep -q 'data_cache_path:' conf/gpt_oss_20B-pretrain-nvidia.yaml; then
+if [ -f conf/gpt_oss_20B-pretrain-nvidia.yaml ]; then
+  # Normalize (not just inject-if-absent): the conf persists across runs, so an
+  # earlier run may have written a stale data_cache_path (e.g. the lustre
+  # /results path, which the container's squashed root cannot write). Delete any
+  # existing data_cache_path line, then set it to container-local /tmp.
+  sed -i '/^[[:space:]]*data_cache_path:/d' conf/gpt_oss_20B-pretrain-nvidia.yaml
   sed -i 's#^\(\s*\)test_data_path:.*#&\n\1data_cache_path: /tmp/gpt_oss_dataset_cache#' conf/gpt_oss_20B-pretrain-nvidia.yaml
-  echo "Injected data_cache_path: /tmp/gpt_oss_dataset_cache into gpt_oss conf"
+  echo "Set data_cache_path: /tmp/gpt_oss_dataset_cache in gpt_oss conf"
 fi
 docker build -t "${MLPERF_GPT_OSS_IMAGE}" -f Dockerfile.nvidia .
 export DGXSYSTEM=H200_1x4x1

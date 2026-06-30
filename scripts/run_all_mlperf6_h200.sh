@@ -29,6 +29,12 @@ Options:
   --skip-downloads         Skip data/model downloads
   --skip-runs              Skip benchmark execution
   --fail-fast              Stop at the first failing stage
+  --quick-run              Hardware-perf mode: time-box each benchmark to a short
+                           sustained window (eval disabled) instead of a full
+                           convergence run. Captures throughput/step-time, NOT a
+                           valid MLPerf submission score.
+  --quick-run-seconds N    Per-benchmark perf window in seconds (default 3600).
+                           Implies --quick-run.
   -h, --help               Show this help
 
 Behavior:
@@ -73,6 +79,15 @@ while [[ $# -gt 0 ]]; do
     --fail-fast)
       CONTINUE_ON_FAILURE=0
       shift
+      ;;
+    --quick-run)
+      export MLPERF_QUICK_RUN=1
+      shift
+      ;;
+    --quick-run-seconds)
+      export MLPERF_QUICK_RUN=1
+      export MLPERF_QUICK_RUN_SECONDS="$2"
+      shift 2
       ;;
     -h|--help)
       usage

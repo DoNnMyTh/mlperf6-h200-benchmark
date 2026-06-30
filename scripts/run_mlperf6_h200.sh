@@ -21,10 +21,16 @@ Benchmarks:
   flux           Text-to-image generation
   all            All benchmark command plans
 
+Options:
+  --quick-run            Hardware-perf mode: time-box the benchmark to a short
+                         sustained window (eval off) instead of full convergence.
+  --quick-run-seconds N  Perf window seconds (default 3600). Implies --quick-run.
+
 Notes:
   - `show` prints the exact commands without running them.
   - `run` requires `--execute`; without it, the script refuses to launch work.
   - `report` writes a markdown summary using the current results directories.
+  - quick-run yields throughput/step-time numbers, NOT a valid submission score.
 EOF
 }
 
@@ -37,6 +43,15 @@ while [[ $# -gt 0 ]]; do
     --execute)
       EXECUTE=1
       shift
+      ;;
+    --quick-run)
+      export MLPERF_QUICK_RUN=1
+      shift
+      ;;
+    --quick-run-seconds)
+      export MLPERF_QUICK_RUN=1
+      export MLPERF_QUICK_RUN_SECONDS="$2"
+      shift 2
       ;;
     -h|--help)
       usage
@@ -55,6 +70,49 @@ fi
 
 # shellcheck disable=SC1090
 source "${ENV_FILE}"
+
+# --- quick-run (hardware-perf) mode ----------------------------------------
+# When MLPERF_QUICK_RUN=1 each benchmark runs a time-boxed PERF window instead of
+# a full convergence run: eval is disabled, the step count is raised to a
+# generous ceiling, and the training launch is wrapped in `timeout` so it stops
+# after MLPERF_QUICK_RUN_SECONDS (default 3600 = ~1h sustained). A timeout exit
+# (124) is treated as success -- the run captured a throughput/step-time sample,
+# not convergence. This yields hardware-performance numbers; it is NOT a valid
+# MLPerf submission result (no target-loss convergence).
+MLPERF_QUICK_RUN="${MLPERF_QUICK_RUN:-0}"
+MLPERF_QUICK_RUN_SECONDS="${MLPERF_QUICK_RUN_SECONDS:-3600}"
+# Step ceilings are intentionally high: with a sustained window the timeout is
+# the real bound, so these only stop a benchmark that is somehow faster than the
+# window. Override per benchmark via env if a step bound is preferred.
+MLPERF_QUICK_LLAMA31_STEPS="${MLPERF_QUICK_LLAMA31_STEPS:-1000000}"
+MLPERF_QUICK_GPT_OSS_ITERS="${MLPERF_QUICK_GPT_OSS_ITERS:-1000000}"
+MLPERF_QUICK_LLAMA2_STEPS="${MLPERF_QUICK_LLAMA2_STEPS:-1000000}"
+MLPERF_QUICK_FLUX_STEPS="${MLPERF_QUICK_FLUX_STEPS:-1000000}"
+# A large value that effectively disables periodic eval within the window.
+MLPERF_QUICK_EVAL_DISABLE="${MLPERF_QUICK_EVAL_DISABLE:-999999999}"
+
+# Render-time helper: emits a `timeout ...` prefix for the training launch when
+# quick-run is on, otherwise nothing. Used inside the render heredocs via $(...).
+quick_timeout_prefix() {
+  if [[ "${MLPERF_QUICK_RUN}" == "1" ]]; then
+    printf 'timeout --signal=TERM --kill-after=60 %s ' "${MLPERF_QUICK_RUN_SECONDS}"
+  fi
+}
+# Render-time helper: emits the trailing handler that converts a timeout (124)
+# into success. It begins with " || quick_ec=$?" so it attaches to the end of the
+# (possibly multi-line) launch command. Emits nothing outside quick-run.
+quick_timeout_suffix() {
+  if [[ "${MLPERF_QUICK_RUN}" == "1" ]]; then
+    cat <<'SUF'
+ || quick_ec=$?
+if [ "${quick_ec:-0}" -eq 124 ]; then
+  echo "quick-run: sustained perf window reached (timeout ${MLPERF_QUICK_RUN_SECONDS:-3600}s); treating as success"
+elif [ "${quick_ec:-0}" -ne 0 ]; then
+  exit "${quick_ec}"
+fi
+SUF
+  fi
+}
 
 find_llama2_rclone_config() {
   local candidates=()
@@ -151,6 +209,15 @@ run_or_print() {
 }
 
 render_llama31() {
+  # In quick-run, raise MAX_STEPS to a high ceiling and push eval out past the
+  # window (the timeout bounds wall-clock). Emitted into the in-container block;
+  # empty (a blank line) outside quick-run.
+  local llama31_quick_exports=""
+  if [[ "${MLPERF_QUICK_RUN}" == "1" ]]; then
+    llama31_quick_exports="export MAX_STEPS=${MLPERF_QUICK_LLAMA31_STEPS}
+export EVAL_EVERY=${MLPERF_QUICK_EVAL_DISABLE}
+export START_EVAL_AT=${MLPERF_QUICK_EVAL_DISABLE}"
+  fi
   cat <<EOF
 set -euo pipefail
 mkdir -p "${MLPERF_LLAMA31_RESULTS_PATH}" "${MLPERF_LLAMA31_CHECKPOINT_PATH}" "${MLPERF_LLAMA31_INDEX_PATH}"
@@ -175,7 +242,7 @@ docker build -t "${MLPERF_LLAMA31_IMAGE}" -f Dockerfile.h200 .
 # under /scratch on this node, so a single bind mount makes all the absolute host
 # paths below resolve identically inside the container; mount the results dir at
 # /mlperf-outputs too so MLLog output persists past the --rm container.
-docker run --rm --gpus all --ipc=host --network host \\
+$(quick_timeout_prefix)docker run --rm --gpus all --ipc=host --network host \\
   --ulimit memlock=-1 --ulimit stack=67108864 \\
   -v /scratch:/scratch \\
   -v "${MLPERF_LLAMA31_RESULTS_PATH}:/mlperf-outputs" \\
@@ -201,15 +268,24 @@ export CONTINUAL_CKPT="${MLPERF_LLAMA31_CHECKPOINT_PATH}"
 export TMP_NPY_INDEX="${MLPERF_LLAMA31_INDEX_PATH}"
 export GBS="${MLPERF_LLAMA31_GBS}"
 export MBS="${MLPERF_LLAMA31_MBS}"
+${llama31_quick_exports}
 # In-container we are root, so the upstream "mkdir /mlperf-outputs" succeeds, but
 # keep the guard non-fatal for safety (the dir is also bind-mounted above).
 sed -i "s@mkdir /mlperf-outputs; fi@mkdir -p /mlperf-outputs 2>/dev/null || true; fi@" run_llama31.sh
 bash ./run_llama31.sh
-'
+'$(quick_timeout_suffix)
 EOF
 }
 
 render_llama2_lora() {
+  # Step/eval bounds. Full run keeps the smoke-test cap (1024); quick-run raises
+  # the cap (timeout bounds wall-clock) and disables periodic eval.
+  local llama2_max_steps="1024"
+  local llama2_eval_steps="48"
+  if [[ "${MLPERF_QUICK_RUN}" == "1" ]]; then
+    llama2_max_steps="${MLPERF_QUICK_LLAMA2_STEPS}"
+    llama2_eval_steps="${MLPERF_QUICK_EVAL_DISABLE}"
+  fi
   cat <<EOF
 set -euo pipefail
 mkdir -p "${MLPERF_LLAMA2_RESULTS_PATH}"
@@ -271,7 +347,7 @@ if [[ "${EFFECTIVE_MLPERF_LLAMA2_MODE}" == "smoke-test" ]]; then
 fi
 
 docker pull "${MLPERF_LLAMA2_DOCKER_IMAGE}"
-docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
+$(quick_timeout_prefix)docker run --rm --gpus all --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
   -e HF_TOKEN="\${HF_TOKEN:-}" \\
   -e MLPERF_LLAMA2_MODE="${EFFECTIVE_MLPERF_LLAMA2_MODE}" \\
   -e MLPERF_LLAMA2_PUBLIC_MODEL_ID="${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" \\
@@ -389,7 +465,7 @@ accelerate launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
   --max_seq_len 8192 \\
   --bf16 True \\
   --logging_steps 24 \\
-  --eval_steps 48 \\
+  --eval_steps ${llama2_eval_steps} \\
   --output_dir "./results/llama-70b_scrolls_gov_report_r16_\${SEED}" \\
   --per_device_train_batch_size 1 \\
   --gradient_accumulation_steps 1 \\
@@ -404,15 +480,27 @@ accelerate launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
   --lora_r 16 \\
   --lora_alpha 32 \\
   --lora_dropout 0.1 \\
-  --max_steps 1024 \\
+  --max_steps ${llama2_max_steps} \\
   --use_flash_attn \\
   --seed "\${SEED}" \\
   --lora_target_modules "qkv_proj,o_proj"
-'
+'$(quick_timeout_suffix)
 EOF
 }
 
 render_gpt_oss20b() {
+  # In quick-run, append step/eval overrides to the generated config. They are
+  # appended (not edited in place) so they win when run_with_docker.sh re-sources
+  # the file, and so its 'compgen -e' env-forward still picks them up. The
+  # timeout bounds wall-clock; the high iter ceiling just avoids finishing early.
+  local gpt_quick_cfg=""
+  if [[ "${MLPERF_QUICK_RUN}" == "1" ]]; then
+    gpt_quick_cfg="cat >> config_H200_1x4x1.sh <<'QCFG'
+export PRIMUS_TRAIN_ITERS=${MLPERF_QUICK_GPT_OSS_ITERS}
+export PRIMUS_EVAL_INTERVAL=${MLPERF_QUICK_EVAL_DISABLE}
+QCFG
+echo \"quick-run: capped gpt_oss to ${MLPERF_QUICK_GPT_OSS_ITERS} iters, eval disabled\""
+  fi
   cat <<EOF
 set -euo pipefail
 mkdir -p "${MLPERF_GPT_OSS_RESULTS_PATH}"
@@ -496,6 +584,7 @@ export MLLOG_SUBMISSION_PLATFORM=H200-4GPU
 export HF_TOKEN="\${HF_TOKEN:-}"
 CFG
 chmod +x config_H200_1x4x1.sh
+${gpt_quick_cfg}
 # Upstream Dockerfile.nvidia clones Primus and runs 'git checkout main', then
 # applies primus_evaluator.patch. Primus main has since moved (the evaluator fix
 # was upstreamed in 8c5bc42d), so that patch no longer applies and the build
@@ -542,17 +631,23 @@ export CLEAR_CACHES="${MLPERF_GPT_OSS_CLEAR_CACHES}"
 set -a
 source ./config_H200_1x4x1.sh
 set +a
-bash ./run_with_docker.sh
+$(quick_timeout_prefix)bash ./run_with_docker.sh$(quick_timeout_suffix)
 EOF
 }
 
 render_flux() {
+  # In quick-run, cap steps high and push eval out past the window (the timeout
+  # bounds wall-clock). One line so the surrounding \-continuation stays valid.
+  local flux_quick_args=""
+  if [[ "${MLPERF_QUICK_RUN}" == "1" ]]; then
+    flux_quick_args="--training.steps=${MLPERF_QUICK_FLUX_STEPS} --eval.eval_freq=${MLPERF_QUICK_EVAL_DISABLE}"
+  fi
   cat <<EOF
 set -euo pipefail
 mkdir -p "${MLPERF_FLUX_RESULTS_PATH}"
 cd "${MLPERF_UPSTREAM_DIR}/text_to_image/torchtitan"
 docker build -t "${MLPERF_FLUX_IMAGE}" -f Dockerfile .
-docker run --rm --gpus all --network=host --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
+$(quick_timeout_prefix)docker run --rm --gpus all --network=host --ipc=host --ulimit memlock=-1 --ulimit stack=67108864 \\
   -v "${MLPERF_HF_CACHE}:/root/.cache" \\
   -v "${MLPERF_FLUX_DATASET_PATH}:/dataset" \\
   -v "${MLPERF_FLUX_MODEL_PATH}:/models" \\
@@ -571,8 +666,9 @@ NGPU="${MLPERF_GPU_COUNT}" \\
   --training.dataset_path=/dataset/cc12m_preprocessed \\
   --eval.dataset_path=/dataset/coco_preprocessed \\
   --encoder.empty_encodings_path=/dataset/empty_encodings \\
+  ${flux_quick_args} \\
   --training.seed=${MLPERF_FLUX_SEED}
-'
+'$(quick_timeout_suffix)
 EOF
 }
 

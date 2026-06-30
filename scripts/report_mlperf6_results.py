@@ -14,6 +14,20 @@ from pathlib import Path
 
 RESULT_RE = re.compile(r"^RESULT,([^,]+),,([0-9]+(?:\.[0-9]+)?),(.+)$")
 
+# Throughput / step-time patterns emitted across the benchmarks' logs. Used to
+# surface hardware-performance numbers (especially for --quick-run perf windows,
+# which intentionally do not converge and so produce no RESULT/run_stop line).
+_NUM = r"([0-9]+(?:\.[0-9]+)?)"
+THROUGHPUT_RES = [
+    re.compile(r'"throughput"\s*:\s*' + _NUM),                       # MLLOG tracked_stats (flux/gpt_oss/llama31)
+    re.compile(r"train_samples_per_second['\"]?\s*[:=]\s*" + _NUM),  # HF Trainer (llama2)
+    re.compile(_NUM + r"\s*samples\s*/\s*s"),                        # generic "N samples/s"
+]
+STEPTIME_RES = [
+    re.compile(r'"train_step_time"\s*:\s*' + _NUM),                  # flux MLLOG
+    re.compile(r"step[_ ]time['\"]?\s*[:=]\s*" + _NUM),              # generic step_time
+]
+
 
 @dataclass
 class BenchmarkReport:
@@ -23,6 +37,40 @@ class BenchmarkReport:
     runtime_seconds: str
     status: str
     notes: str
+    perf: str
+
+
+def _collect(patterns: list[re.Pattern[str]], lines: list[str]) -> list[float]:
+    values: list[float] = []
+    for line in lines:
+        for rx in patterns:
+            match = rx.search(line)
+            if match:
+                try:
+                    values.append(float(match.group(1)))
+                except ValueError:
+                    pass
+                break
+    return values
+
+
+def extract_perf(lines: list[str] | None) -> str:
+    """Best-effort hardware-perf summary: mean throughput/step-time over the last
+    measured steps (steady state). Returns '-' when no perf numbers are present."""
+    if not lines:
+        return "-"
+    thr = _collect(THROUGHPUT_RES, lines)
+    step = _collect(STEPTIME_RES, lines)
+    if not thr and not step:
+        return "-"
+    parts: list[str] = []
+    if thr:
+        tail = thr[-50:]
+        parts.append(f"~{sum(tail) / len(tail):.1f} samples/s (n={len(thr)})")
+    if step:
+        tail = step[-50:]
+        parts.append(f"step ~{sum(tail) / len(tail):.3f}s")
+    return ", ".join(parts)
 
 
 @dataclass
@@ -92,18 +140,19 @@ def latest_log_file(results_dir: Path) -> Path | None:
     return max(candidates, key=lambda path: path.stat().st_mtime)
 
 
-def inspect_log(log_path: Path | None) -> tuple[str, str, str]:
+def inspect_log(log_path: Path | None, lines: list[str] | None) -> tuple[str, str, str]:
     if log_path is None:
         return ("not-run", "-", "No log files found")
+    if lines is None:
+        return ("unreadable", "-", f"Failed to read {log_path}")
 
     runtime = "-"
     status = "log-found"
     notes = f"Latest log: {log_path}"
 
-    try:
-        lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
-    except OSError as exc:
-        return ("unreadable", "-", f"Failed to read {log_path}: {exc}")
+    # A quick-run perf window is stopped by timeout, so it never emits a
+    # convergence RESULT/run_stop; flag it so the status reads as perf-only.
+    quick = any("quick-run: sustained perf window" in line for line in lines)
 
     for line in lines:
         match = RESULT_RE.match(line.strip())
@@ -122,6 +171,10 @@ def inspect_log(log_path: Path | None) -> tuple[str, str, str]:
             notes = line.strip()
             break
 
+    if quick and status not in {"failed"}:
+        status = "perf-only (quick-run)"
+        notes = "Quick-run perf window (time-boxed, not convergence); see Hardware Perf column"
+
     return (status, runtime, notes)
 
 
@@ -135,7 +188,13 @@ def build_reports(env: dict[str, str]) -> list[BenchmarkReport]:
     reports: list[BenchmarkReport] = []
     for name, results_dir in rows:
         log_path = latest_log_file(results_dir)
-        status, runtime, notes = inspect_log(log_path)
+        lines: list[str] | None = None
+        if log_path is not None:
+            try:
+                lines = log_path.read_text(encoding="utf-8", errors="replace").splitlines()
+            except OSError:
+                lines = None
+        status, runtime, notes = inspect_log(log_path, lines)
         reports.append(
             BenchmarkReport(
                 name=name,
@@ -144,6 +203,7 @@ def build_reports(env: dict[str, str]) -> list[BenchmarkReport]:
                 runtime_seconds=runtime,
                 status=status,
                 notes=notes,
+                perf=extract_perf(lines),
             )
         )
     return reports
@@ -190,14 +250,14 @@ def render_markdown(
         "",
         "## Benchmark Summary",
         "",
-        "| Benchmark | Status | Runtime (s) | Results Dir | Notes |",
-        "| --- | --- | ---: | --- | --- |",
+        "| Benchmark | Status | Runtime (s) | Hardware Perf | Results Dir | Notes |",
+        "| --- | --- | ---: | --- | --- | --- |",
     ]
 
     for report in reports:
         lines.append(
             f"| {report.name} | {report.status} | {report.runtime_seconds} | "
-            f"`{report.results_dir}` | {report.notes} |"
+            f"{report.perf} | `{report.results_dir}` | {report.notes} |"
         )
 
     if pipeline_rows:

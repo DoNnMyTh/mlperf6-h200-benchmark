@@ -155,10 +155,17 @@ render_llama31() {
 set -euo pipefail
 mkdir -p "${MLPERF_LLAMA31_RESULTS_PATH}" "${MLPERF_LLAMA31_CHECKPOINT_PATH}" "${MLPERF_LLAMA31_INDEX_PATH}"
 cd "${MLPERF_UPSTREAM_DIR}/small_llm_pretraining/nemo"
-# pretrain_llama31.py does 'import wandb' unconditionally, but Dockerfile.h200
-# does not install it, so the container aborts with ModuleNotFoundError. Append
-# the install plus offline mode (so wandb.init needs no API key). Idempotent:
-# only added once, so re-runs over an already-patched Dockerfile are a no-op.
+# pretrain_llama31.py does 'import wandb' unconditionally, and TWO separate
+# Python environments import it -- both must have wandb or the run aborts with
+# ModuleNotFoundError:
+#   1. the HOST launcher -- run_llama31.sh invokes 'python3 pretrain_llama31.py'
+#      on the host to submit the job (submitit), so the host interpreter imports
+#      wandb before anything containerized runs. This is what actually failed:
+#      the traceback path was the host work dir, not /workspace in the image.
+#   2. the in-container training process, via the same top-level import.
+# Cover both: the idempotent Dockerfile append handles (2); the host pip install
+# (just before launch, below) handles (1). WANDB_MODE=offline so wandb.init
+# needs no API key in either environment.
 if ! grep -q 'pip install wandb' Dockerfile.h200; then
   printf '\nRUN pip install --no-cache-dir wandb\nENV WANDB_MODE=offline\n' >> Dockerfile.h200
   echo "Added wandb install + offline mode to Dockerfile.h200"
@@ -192,6 +199,13 @@ export CUDA_HOME="${MLPERF_CUDA_HOME}"
 # proceeds without root; the container still gets /mlperf-outputs via the mount.
 mkdir -p /mlperf-outputs 2>/dev/null || sudo -n mkdir -p /mlperf-outputs 2>/dev/null || true
 sed -i 's@mkdir /mlperf-outputs; fi@mkdir -p /mlperf-outputs 2>/dev/null || true; fi@' run_llama31.sh
+# Install wandb into the HOST interpreter that runs pretrain_llama31.py (see the
+# note above -- the submitit launcher imports wandb on the host). Try a plain
+# install, then user-site, then break-system-packages, to cover a normal host,
+# a PEP 668 externally-managed host, and a venv host respectively.
+python3 -m pip install --no-cache-dir --quiet wandb \\
+  || python3 -m pip install --no-cache-dir --quiet --user wandb \\
+  || python3 -m pip install --no-cache-dir --quiet --break-system-packages wandb
 bash ./run_llama31.sh
 EOF
 }
@@ -289,7 +303,25 @@ export HF_HUB_DISABLE_XET=1
 export HF_HUB_ENABLE_HF_TRANSFER=0
 echo "Resolved llama2_lora mode inside container: \${MLPERF_LLAMA2_MODE}"
 pip install -r requirements.txt
-pip install flash-attn==2.1.0 --no-build-isolation
+# flash-attn: the upstream step force-builds 2.1.0 from source, but 2.1.0 (Sep
+# 2023) predates CUDA 13 / Hopper sm_90 and will not compile on this H200 node
+# (the build first died with "Python.h: No such file or directory", and even
+# with headers the sm_90 / CUDA 13.2 compile is unsupported). Prefer a flash-attn
+# already bundled in the container image -- nvcr/pytorch images ship one matched
+# to the container torch+CUDA, which is what we actually want on Hopper. Only
+# if none is importable, fall back to a source build: install the Python C dev
+# headers for the running interpreter (python3.12-dev -> Python.h at
+# /usr/include/python3.12/) and target sm_90.
+if python3 -c "import flash_attn" >/dev/null 2>&1; then
+  echo "Using flash-attn already present in image: \$(python3 -c "import flash_attn, sys; sys.stdout.write(flash_attn.__version__)")"
+else
+  echo "flash-attn not in image; installing dev headers and building from source for sm_90"
+  LLAMA2_PYV=\$(python3 -V 2>&1 | cut -d" " -f2 | cut -d. -f1,2)
+  apt-get update -y || true
+  apt-get install -y --no-install-recommends python\${LLAMA2_PYV}-dev \\
+    || apt-get install -y --no-install-recommends python3-dev || true
+  TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=32 pip install flash-attn==2.1.0 --no-build-isolation
+fi
 git clone --depth 1 https://github.com/mlperf/logging.git /tmp/mlperf-logging
 pip install -e /tmp/mlperf-logging
 if [[ -n "\${HF_TOKEN:-}" ]]; then
@@ -386,6 +418,18 @@ export NNODES=1
 export NODE_RANK=0
 export MASTER_ADDR=localhost
 export MASTER_PORT=29501
+
+# Megatron-LM requires CUDA_DEVICE_MAX_CONNECTIONS=1 for correctly ordered
+# comm/compute overlap. Without it the synthetic warmup's all-reduce raced
+# across CUDA streams and aborted with "unhandled cuda error / Failed to CUDA
+# calloc async 72 bytes" (preceded by AccumulateGrad stream-mismatch warnings
+# from schedules.py). NCCL_DEBUG=WARN surfaces the NCCL error if it recurs.
+# These reach the in-container training process: run_with_docker.sh auto-forwards
+# every var this config exports -- it builds its "docker exec --env=" list from
+# "compgen -e" after sourcing this file in a clean env, so any exported name here
+# is passed through. Verified against the upstream run_with_docker.sh.
+export CUDA_DEVICE_MAX_CONNECTIONS=1
+export NCCL_DEBUG=WARN
 
 export PRIMUS_PATH=/workspace/deps/Primus
 export PYTHONPATH="\${PRIMUS_PATH}:\${PRIMUS_PATH}/third_party/Megatron-LM:\${PYTHONPATH:-}"
@@ -500,8 +544,8 @@ CONFIG_FILE=./torchtitan/experiments/flux/train_configs/flux_schnell_mlperf_prep
 NGPU="${MLPERF_GPU_COUNT}" \\
 ./torchtitan/experiments/flux/run_train.sh \\
   --job.dump_folder=/results \\
-  --training.dataset_path=/dataset/cc12m_preprocessed/* \\
-  --eval.dataset_path=/dataset/coco_preprocessed/* \\
+  --training.dataset_path=/dataset/cc12m_preprocessed \\
+  --eval.dataset_path=/dataset/coco_preprocessed \\
   --encoder.empty_encodings_path=/dataset/empty_encodings \\
   --training.seed=${MLPERF_FLUX_SEED}
 '

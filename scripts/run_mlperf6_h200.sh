@@ -279,6 +279,12 @@ ${llama31_quick_exports}
 # In-container we are root, so the upstream "mkdir /mlperf-outputs" succeeds, but
 # keep the guard non-fatal for safety (the dir is also bind-mounted above).
 sed -i "s@mkdir /mlperf-outputs; fi@mkdir -p /mlperf-outputs 2>/dev/null || true; fi@" run_llama31.sh
+# pretrain_llama31.py runs the experiment with detach=True, so nemo_run launches
+# the training job with log=False: the console shows only "Waiting for job ...
+# [log=False]" while the GPUs are saturated, which looks hung. Flip it to
+# detach=False so the job logs stream to stdout (and into the orchestrator log
+# and the false-success grep below). Idempotent.
+sed -i "s@exp.run(sequential=True, detach=True)@exp.run(sequential=True, detach=False)@" pretrain_llama31.py
 # nemo_run/LocalExecutor swallows task failures and exits 0, and writes the real
 # training logs into its own experiment dir rather than stdout -- so the
 # orchestrator marked a FAILED experiment as success and its console looked

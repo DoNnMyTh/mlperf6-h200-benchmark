@@ -5,6 +5,10 @@ set -euo pipefail
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/.." && pwd)"
 ENV_FILE="${REPO_ROOT}/configs/mlperf6-h200-4gpu.env"
+# Default to hardware-perf (quick-run) mode: each benchmark runs a short
+# time-boxed window and reports throughput, which is the purpose of this harness.
+# Pass --full to do a real convergence run instead. Honor a pre-set env value.
+export MLPERF_QUICK_RUN="${MLPERF_QUICK_RUN:-1}"
 REPORT_OUTPUT=""
 CONTINUE_ON_FAILURE=1
 SKIP_BOOTSTRAP=0
@@ -29,12 +33,13 @@ Options:
   --skip-downloads         Skip data/model downloads
   --skip-runs              Skip benchmark execution
   --fail-fast              Stop at the first failing stage
-  --quick-run              Hardware-perf mode: time-box each benchmark to a short
-                           sustained window (eval disabled) instead of a full
-                           convergence run. Captures throughput/step-time, NOT a
-                           valid MLPerf submission score.
+  --quick-run              Hardware-perf mode (DEFAULT): time-box each benchmark to
+                           a short window (eval disabled) and report
+                           throughput/step-time. NOT a valid MLPerf submission.
   --quick-run-seconds N    Per-benchmark perf window in seconds (default 300).
-                           Implies --quick-run.
+  --full                   Real convergence run (no time-box) instead of the
+                           default hardware-perf mode. Use for a submission-style
+                           run; takes hours per benchmark.
   -h, --help               Show this help
 
 Behavior:
@@ -88,6 +93,10 @@ while [[ $# -gt 0 ]]; do
       export MLPERF_QUICK_RUN=1
       export MLPERF_QUICK_RUN_SECONDS="$2"
       shift 2
+      ;;
+    --full)
+      export MLPERF_QUICK_RUN=0
+      shift
       ;;
     -h|--help)
       usage

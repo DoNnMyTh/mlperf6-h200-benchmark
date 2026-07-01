@@ -594,17 +594,23 @@ ntr, nval = int(sys.argv[4]), int(sys.argv[5])
 block = int(sys.argv[7]) if len(sys.argv) > 7 else 8192
 os.makedirs(out, exist_ok=True)
 def load_tok(md):
+    from transformers import LlamaTokenizerFast, LlamaTokenizer
+    tj = os.path.join(md, "tokenizer.json")
+    if os.path.exists(tj):
+        try:
+            return LlamaTokenizerFast(tokenizer_file=tj, bos_token="<s>", eos_token="</s>", unk_token="<unk>")
+        except Exception:
+            pass
+    tm = os.path.join(md, "tokenizer.model")
+    if os.path.exists(tm):
+        try:
+            return LlamaTokenizer(vocab_file=tm)
+        except Exception:
+            pass
     try:
-        from transformers import LlamaTokenizerFast
         return LlamaTokenizerFast.from_pretrained(md)
     except Exception:
-        pass
-    try:
-        from transformers import LlamaTokenizer
         return LlamaTokenizer.from_pretrained(md)
-    except Exception:
-        pass
-    return AutoTokenizer.from_pretrained(md, use_fast=True)
 tok = load_tok(model_dir)
 eos = tok.eos_token or ""
 ds = load_dataset(name, config, trust_remote_code=True)
@@ -625,6 +631,9 @@ build(ds["train"], ntr).to_parquet(out + "/train-00000-of-00001.parquet")
 build(ds["validation"], nval).to_parquet(out + "/validation-00000-of-00001.parquet")
 print("tokenized+packed smoke dataset (block " + str(block) + ") prepared at " + out)
 PYEOF
+  # sentencepiece backs the LlamaTokenizer(vocab_file=tokenizer.model) fallback
+  # (used only if the model ships no tokenizer.json); best-effort, non-fatal.
+  python3 -m pip install -q sentencepiece >/dev/null 2>&1 || true
   # Pass params as argv (bash expands them). argv 6 = model dir for the tokenizer,
   # argv 7 = block size (matches --max_seq_len below).
   python3 /tmp/prep_llama2_smoke.py "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" "\${LLAMA2_DATA_DIR}" "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES:-128}" "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES:-32}" "\${LLAMA2_MODEL_DIR}" 8192

@@ -590,6 +590,38 @@ SEED="${MLPERF_LLAMA2_SEED}"
 # (checkpoints) goes to /tmp for the same reason.
 export COMPLIANCE_FILE=/tmp/mlperf_compliance.log
 mkdir -p /tmp/llama2_results
+# deepspeed (pinned old by requirements.txt) imports a module-level log symbol
+# from torch.distributed.elastic.agent.server.api, but torch >=2.4 renamed it to
+# logger, so import deepspeed dies with "cannot import name log". Add a back-compat
+# log alias (idempotent, non-fatal). Patch the torch module file because deepspeed
+# binds the name at import time; if torch is a non-writable system path, fall back
+# to rewriting deepspeed elastic_agent.py under the user site (writable).
+cat > /tmp/patch_ds_log.py <<PYEOF
+import io, os, sys, glob
+import torch.distributed.elastic.agent.server.api as m
+p = m.__file__
+if hasattr(m, "log"):
+    sys.exit(0)
+add = "\ntry:\n    log\nexcept NameError:\n    try:\n        log = logger\n    except NameError:\n        import logging as _l\n        log = _l.getLogger(__name__)\n"
+try:
+    if "log = logger" not in io.open(p, "r", encoding="utf-8").read():
+        io.open(p, "a", encoding="utf-8").write(add)
+    print("patched torch api for deepspeed log alias: " + p)
+    sys.exit(0)
+except OSError as e:
+    print("torch api not writable (" + str(e) + "); patching deepspeed elastic_agent.py")
+old = "from torch.distributed.elastic.agent.server.api import log, _get_socket_with_port"
+new = "try:\n    from torch.distributed.elastic.agent.server.api import log, _get_socket_with_port\nexcept ImportError:\n    from torch.distributed.elastic.agent.server.api import _get_socket_with_port\n    try:\n        from torch.distributed.elastic.agent.server.api import logger as log\n    except ImportError:\n        import logging as _l2\n        log = _l2.getLogger(__name__)"
+cands = []
+for base in [os.path.expanduser("~/.local"), "/usr/local/lib64", "/usr/local/lib"]:
+    cands += glob.glob(base + "/**/deepspeed/elasticity/elastic_agent.py", recursive=True)
+for f in cands:
+    s = io.open(f, "r", encoding="utf-8").read()
+    if old in s:
+        io.open(f, "w", encoding="utf-8").write(s.replace(old, new))
+        print("patched deepspeed elastic_agent.py: " + f)
+PYEOF
+python3 /tmp/patch_ds_log.py || echo "log-alias patch step skipped (non-fatal)"
 # Use the module form so it works whether accelerate is on PATH or only importable.
 python3 -m accelerate.commands.launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
   --dataset_path "\${LLAMA2_DATA_DIR}" \\

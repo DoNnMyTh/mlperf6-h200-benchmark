@@ -37,7 +37,7 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = load_dataset(args.dataset_name, args.dataset_config)
+    dataset = load_dataset(args.dataset_name, args.dataset_config, trust_remote_code=True)
     train_split = keep_required_columns(trim_dataset(dataset["train"], args.train_samples))
     validation_split = keep_required_columns(
         trim_dataset(dataset["validation"], args.validation_samples)

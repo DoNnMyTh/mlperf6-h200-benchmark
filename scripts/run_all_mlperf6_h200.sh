@@ -386,7 +386,60 @@ download_llama31() {
   download_r2_named "llama31" "tokenizer" "${MLPERF_LLAMA31_TOKENIZER_PATH}" "${MLPERF_LLAMA31_TOKENIZER_URI}" || return 1
 }
 
+# Pre-stage the public model + GovReport dataset to the LOCAL paths the runner
+# reads (so the run resolves to 'official' and reads them in place -- no 130 GB
+# download inside the 5-minute container window). Runs in the llama2 image as the
+# INVOKING USER so writes land on the root-squashed lustre mount. Triggered when
+# HF_TOKEN is set (i.e. you ran `huggingface-cli login`). Idempotent:
+# huggingface-cli download resumes/skips, the dataset prep is skipped if present.
+prestage_llama2_from_hf() {
+  local data_local="$1" model_local="$2"
+  require_cmd "llama2_lora" "download" "docker" || return 1
+  local img="${MLPERF_LLAMA2_DOCKER_IMAGE}" uid gid
+  uid="$(id -u)"; gid="$(id -g)"
+  local command_text
+  command_text=$(cat <<EOF
+set -euo pipefail
+mkdir -p "${model_local}" "${data_local}"
+docker pull "${img}" >/dev/null 2>&1 || true
+docker run --rm --user ${uid}:${gid} \\
+  -e HF_TOKEN="\${HF_TOKEN:-}" \\
+  -v "${model_local}:/model_out" \\
+  -v "${data_local}:/data_out" \\
+  -v "${REPO_ROOT}:/repo:ro" \\
+  "${img}" bash -lc '
+set -euo pipefail
+export HOME=/tmp HF_HOME=/tmp/hf_home HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0
+export PATH="/tmp/.local/bin:\$PATH"
+python3 -m pip install --user -q "huggingface_hub[cli]" "datasets>=2,<3" >/dev/null 2>&1 || true
+echo "Staging model ${MLPERF_LLAMA2_PUBLIC_MODEL_ID} -> local model dir (resumes/skips existing)"
+huggingface-cli download "${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir /model_out --max-workers 4
+if [ ! -f /data_out/train-00000-of-00001.parquet ]; then
+  echo "Staging GovReport dataset -> local dataset dir"
+  python3 /repo/scripts/prepare_llama2_lora_smoke_dataset.py --dataset-name "${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" --dataset-config "${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" --output-dir /data_out --train-samples "\${MLPERF_LLAMA2_PRESTAGE_TRAIN_SAMPLES:-8000}" --validation-samples "\${MLPERF_LLAMA2_PRESTAGE_VAL_SAMPLES:-970}"
+fi
+echo "llama2 prestage complete"
+'
+EOF
+)
+  run_logged "llama2_lora" "download" "${command_text}"
+}
+
 download_llama2_lora() {
+  local data_local="${MLPERF_LLAMA2_DATASET_PATH}/${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}"
+  local model_local="${MLPERF_LLAMA2_MODEL_ROOT}/${MLPERF_LLAMA2_LOCAL_MODEL_SUBDIR}"
+  # Already staged (dataset parquet + a non-empty model dir) -> nothing to do.
+  if [[ -f "${data_local}/train-00000-of-00001.parquet" && -d "${model_local}" && -n "$(ls -A "${model_local}" 2>/dev/null)" ]]; then
+    record_status "llama2_lora" "download" "skipped" "dataset+model already staged at ${data_local} and ${model_local}"
+    return 0
+  fi
+  # With an HF login, auto-stage from HuggingFace to the local official paths.
+  if [[ -n "${HF_TOKEN:-}" ]]; then
+    if prestage_llama2_from_hf "${data_local}" "${model_local}"; then
+      return 0
+    fi
+    log "llama2_lora HF prestage failed; falling back to mode-based handling"
+  fi
   case "${EFFECTIVE_MLPERF_LLAMA2_MODE}" in
     official)
       if [[ -d "${MLPERF_LLAMA2_DATASET_PATH}/${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}" && -d "${MLPERF_LLAMA2_MODEL_ROOT}/${MLPERF_LLAMA2_LOCAL_MODEL_SUBDIR}" ]]; then

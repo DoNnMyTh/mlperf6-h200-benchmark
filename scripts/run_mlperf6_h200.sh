@@ -451,6 +451,10 @@ if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
   fi
 fi
 echo "llama2 data dir: \${LLAMA2_DATA_DIR} | model dir: \${LLAMA2_MODEL_DIR}"
+# pip reports "normal site-packages is not writeable" and installs console
+# scripts (accelerate, huggingface-cli, ...) into the user site's bin, which is
+# not on PATH -> "accelerate: command not found". Put it on PATH.
+export PATH="\${HOME:-/root}/.local/bin:/root/.local/bin:\${PATH}"
 pip install -r requirements.txt
 # flash-attn: the upstream step force-builds 2.1.0 from source, but 2.1.0 (Sep
 # 2023) predates CUDA 13 / Hopper sm_90 and will not compile on this H200 node
@@ -580,7 +584,8 @@ if [[ ! -d "\${LLAMA2_MODEL_DIR}" ]]; then
   exit 1
 fi
 SEED="${MLPERF_LLAMA2_SEED}"
-accelerate launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
+# Use the module form so it works whether accelerate is on PATH or only importable.
+python3 -m accelerate.commands.launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
   --dataset_path "\${LLAMA2_DATA_DIR}" \\
   --model_path "\${LLAMA2_MODEL_DIR}" \\
   --max_seq_len 8192 \\

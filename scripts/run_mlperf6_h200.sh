@@ -501,7 +501,10 @@ pip install -e /tmp/mlperf-logging
 if [[ -n "\${HF_TOKEN:-}" ]]; then
   huggingface-cli login --token "\${HF_TOKEN}"
 fi
-if [[ "\${MLPERF_LLAMA2_MODE}" == "local-only" || "\${MLPERF_LLAMA2_MODE}" == "smoke-test" ]]; then
+if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
+  # Download the public model for any non-official mode (local-only, smoke-test,
+  # and the unresolved "auto" the container sometimes receives). Gating on the
+  # exact strings skipped auto and failed with "model directory missing".
   # Always invoke the downloader. huggingface-cli download resumes and only
   # fetches missing files, so an earlier interrupted run that left an INCOMPLETE
   # model directory is repaired instead of being wrongly treated as complete

@@ -413,14 +413,20 @@ export HOME=/tmp HF_HOME=/tmp/hf_home HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRAN
 export PATH="/tmp/.local/bin:\$PATH"
 python3 -m pip install --user -q "huggingface_hub[cli]" "datasets>=2,<3" >/dev/null 2>&1 || true
 echo "Staging model ${MLPERF_LLAMA2_PUBLIC_MODEL_ID} -> local model dir (resumes/skips existing)"
+# Newer huggingface_hub removed the huggingface-cli entrypoint in favor of hf
+# ("huggingface-cli is deprecated and no longer works"). Prefer hf, fall back to
+# huggingface-cli for older hubs.
+HFC=hf; command -v hf >/dev/null 2>&1 || HFC=huggingface-cli
 # The 70B model is ~130 GB; the writer can die mid-download. Each attempt resumes
-# and only fetches missing shards, so retry so a single hiccup does not fail the
-# prestage (which would drop the training back to a re-download into /tmp).
+# and only fetches missing shards, so retry; hard-fail if none succeed so the
+# caller does not treat an empty model dir as a completed prestage.
+prestage_ok=0
 for attempt in 1 2 3 4 5 6 7 8 9 10; do
-  huggingface-cli download "${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir /model_out --max-workers 4 && break
+  if "\${HFC}" download "${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir /model_out --max-workers 4; then prestage_ok=1; break; fi
   echo "prestage model download attempt \${attempt} failed; resuming and retrying"
   sleep 5
 done
+if [ "\${prestage_ok}" -ne 1 ]; then echo "ERROR: prestage model download failed after retries" >&2; exit 1; fi
 if [ ! -f /data_out/train-00000-of-00001.parquet ]; then
   echo "Staging GovReport dataset -> local dataset dir"
   python3 /repo/scripts/prepare_llama2_lora_smoke_dataset.py --dataset-name "${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" --dataset-config "${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" --output-dir /data_out --train-samples "\${MLPERF_LLAMA2_PRESTAGE_TRAIN_SAMPLES:-8000}" --validation-samples "\${MLPERF_LLAMA2_PRESTAGE_VAL_SAMPLES:-970}"

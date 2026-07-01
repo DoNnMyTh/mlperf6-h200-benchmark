@@ -511,8 +511,13 @@ fi
 rm -rf /tmp/mlperf-logging
 git clone --depth 1 https://github.com/mlperf/logging.git /tmp/mlperf-logging
 pip install -e /tmp/mlperf-logging
+# Newer huggingface_hub dropped the huggingface-cli entrypoint in favor of hf
+# ("huggingface-cli is deprecated and no longer works"). Pick whichever exists.
+# Auth is via the HF_TOKEN env (honored by both CLIs and the python hub), so the
+# explicit login is best-effort (|| true) and never aborts the run under set -e.
+HFC=hf; command -v hf >/dev/null 2>&1 || HFC=huggingface-cli
 if [[ -n "\${HF_TOKEN:-}" ]]; then
-  huggingface-cli login --token "\${HF_TOKEN}"
+  if [[ "\${HFC}" == "hf" ]]; then hf auth login --token "\${HF_TOKEN}" || true; else huggingface-cli login --token "\${HF_TOKEN}" || true; fi
 fi
 if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
   # Download the public model for any non-official mode (local-only, smoke-test,
@@ -532,7 +537,7 @@ if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
   else
     model_download_ok=0
     for attempt in 1 2 3 4 5 6 7 8 9 10; do
-      if huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "\${LLAMA2_MODEL_DIR}" --max-workers 1; then
+      if "\${HFC}" download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "\${LLAMA2_MODEL_DIR}" --max-workers 1; then
         model_download_ok=1
         break
       fi

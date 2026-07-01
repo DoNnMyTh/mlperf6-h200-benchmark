@@ -607,10 +607,14 @@ def load_tok(md):
             return LlamaTokenizer(vocab_file=tm)
         except Exception:
             pass
-    try:
-        return LlamaTokenizerFast.from_pretrained(md)
-    except Exception:
-        return LlamaTokenizer.from_pretrained(md)
+    # The fused-qkv weights repo ships no tokenizer files, so pull the standard
+    # Llama2 tokenizer from a public repo (LlamaConfig -> no custom code / prompt).
+    for repo in ["NousResearch/Llama-2-70b-hf", "NousResearch/Llama-2-7b-hf", "meta-llama/Llama-2-70b-hf"]:
+        try:
+            return LlamaTokenizerFast.from_pretrained(repo)
+        except Exception:
+            pass
+    raise SystemExit("could not load a Llama2 tokenizer from the model dir or public repos")
 tok = load_tok(model_dir)
 eos = tok.eos_token or ""
 ds = load_dataset(name, config, trust_remote_code=True)

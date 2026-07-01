@@ -452,7 +452,7 @@ if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
 fi
 echo "llama2 data dir: \${LLAMA2_DATA_DIR} | model dir: \${LLAMA2_MODEL_DIR}"
 # pip reports "normal site-packages is not writeable" and installs console
-# scripts (accelerate, huggingface-cli, ...) into the user site's bin, which is
+# scripts (accelerate, huggingface-cli, ...) into the user-site bin, which is
 # not on PATH -> "accelerate: command not found". Put it on PATH.
 export PATH="\${HOME:-/root}/.local/bin:/root/.local/bin:\${PATH}"
 pip install -r requirements.txt

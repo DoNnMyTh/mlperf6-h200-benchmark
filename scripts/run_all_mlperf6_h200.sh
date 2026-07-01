@@ -413,7 +413,14 @@ export HOME=/tmp HF_HOME=/tmp/hf_home HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRAN
 export PATH="/tmp/.local/bin:\$PATH"
 python3 -m pip install --user -q "huggingface_hub[cli]" "datasets>=2,<3" >/dev/null 2>&1 || true
 echo "Staging model ${MLPERF_LLAMA2_PUBLIC_MODEL_ID} -> local model dir (resumes/skips existing)"
-huggingface-cli download "${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir /model_out --max-workers 4
+# The 70B model is ~130 GB; the writer can die mid-download. Each attempt resumes
+# and only fetches missing shards, so retry so a single hiccup does not fail the
+# prestage (which would drop the training back to a re-download into /tmp).
+for attempt in 1 2 3 4 5 6 7 8 9 10; do
+  huggingface-cli download "${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir /model_out --max-workers 4 && break
+  echo "prestage model download attempt \${attempt} failed; resuming and retrying"
+  sleep 5
+done
 if [ ! -f /data_out/train-00000-of-00001.parquet ]; then
   echo "Staging GovReport dataset -> local dataset dir"
   python3 /repo/scripts/prepare_llama2_lora_smoke_dataset.py --dataset-name "${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" --dataset-config "${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" --output-dir /data_out --train-samples "\${MLPERF_LLAMA2_PRESTAGE_TRAIN_SAMPLES:-8000}" --validation-samples "\${MLPERF_LLAMA2_PRESTAGE_VAL_SAMPLES:-970}"
@@ -427,7 +434,10 @@ EOF
 
 download_llama2_lora() {
   local data_local="${MLPERF_LLAMA2_DATASET_PATH}/${MLPERF_LLAMA2_LOCAL_DATASET_SUBDIR}"
-  local model_local="${MLPERF_LLAMA2_MODEL_ROOT}/${MLPERF_LLAMA2_LOCAL_MODEL_SUBDIR}"
+  # Stage the public HF model under the SAME dirname the in-container training
+  # reads for non-official modes (LLAMA2_MODEL_SUBDIR = PUBLIC_MODEL_DIRNAME), so
+  # the training container finds it at /models/<dir> and skips the /tmp download.
+  local model_local="${MLPERF_LLAMA2_MODEL_ROOT}/${MLPERF_LLAMA2_PUBLIC_MODEL_DIRNAME}"
   # Already staged (dataset parquet + a non-empty model dir) -> nothing to do.
   if [[ -f "${data_local}/train-00000-of-00001.parquet" && -d "${model_local}" && -n "$(ls -A "${model_local}" 2>/dev/null)" ]]; then
     record_status "llama2_lora" "download" "skipped" "dataset+model already staged at ${data_local} and ${model_local}"

@@ -445,7 +445,16 @@ echo "Resolved llama2_lora mode inside container: \${MLPERF_LLAMA2_MODE}"
 LLAMA2_DATA_DIR="/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}"
 LLAMA2_MODEL_DIR="/models/\${LLAMA2_MODEL_SUBDIR}"
 if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
-  LLAMA2_MODEL_DIR="/tmp/llama2_model/\${LLAMA2_MODEL_SUBDIR}"
+  # Prefer a persistent, prestaged model under the /models mount: the
+  # download_llama2_lora prestage fetches the 70B there once as the host user (the
+  # training container root is squashed on lustre and cannot write /models), so
+  # reuse it across runs instead of re-downloading ~130 GB into ephemeral /tmp
+  # every --rm run. Fall back to a /tmp download only when nothing is prestaged.
+  if [[ -f "/models/\${LLAMA2_MODEL_SUBDIR}/config.json" ]]; then
+    LLAMA2_MODEL_DIR="/models/\${LLAMA2_MODEL_SUBDIR}"
+  else
+    LLAMA2_MODEL_DIR="/tmp/llama2_model/\${LLAMA2_MODEL_SUBDIR}"
+  fi
   if [[ "\${MLPERF_LLAMA2_MODE}" != "local-only" ]]; then
     LLAMA2_DATA_DIR="/tmp/llama2_data/\${LLAMA2_DATASET_SUBDIR}"
   fi
@@ -518,18 +527,22 @@ if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
   # "[Errno 14] Bad address" writing to lustre). Each attempt resumes and only
   # fetches what is missing, so retry a few times with fewer parallel writers;
   # this completes the remaining shards across attempts.
-  model_download_ok=0
-  for attempt in 1 2 3 4 5 6 7 8 9 10; do
-    if huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "\${LLAMA2_MODEL_DIR}" --max-workers 1; then
-      model_download_ok=1
-      break
+  if [[ -f "\${LLAMA2_MODEL_DIR}/config.json" ]]; then
+    echo "Using existing model at \${LLAMA2_MODEL_DIR} (prestaged or previously downloaded); skipping download"
+  else
+    model_download_ok=0
+    for attempt in 1 2 3 4 5 6 7 8 9 10; do
+      if huggingface-cli download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "\${LLAMA2_MODEL_DIR}" --max-workers 1; then
+        model_download_ok=1
+        break
+      fi
+      echo "llama2 model download attempt \${attempt} failed; resuming and retrying"
+      sleep 5
+    done
+    if [[ "\${model_download_ok}" -ne 1 ]]; then
+      echo "ERROR: llama2 model download did not complete after repeated attempts" >&2
+      exit 1
     fi
-    echo "llama2 model download attempt \${attempt} failed; resuming and retrying"
-    sleep 5
-  done
-  if [[ "\${model_download_ok}" -ne 1 ]]; then
-    echo "ERROR: llama2 model download did not complete after repeated attempts" >&2
-    exit 1
   fi
   for required in config.json modeling_llama.py model.safetensors.index.json; do
     if [[ ! -f "\${LLAMA2_MODEL_DIR}/\${required}" ]]; then

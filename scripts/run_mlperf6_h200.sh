@@ -584,6 +584,12 @@ if [[ ! -d "\${LLAMA2_MODEL_DIR}" ]]; then
   exit 1
 fi
 SEED="${MLPERF_LLAMA2_SEED}"
+# train.py writes mlperf_compliance.log to the CWD (/workspace, a lustre mount the
+# container root cannot write -> "Permission denied"). mlperf_logging_utils reads
+# the path from COMPLIANCE_FILE; point it at container-local /tmp. The output_dir
+# (checkpoints) goes to /tmp for the same reason.
+export COMPLIANCE_FILE=/tmp/mlperf_compliance.log
+mkdir -p /tmp/llama2_results
 # Use the module form so it works whether accelerate is on PATH or only importable.
 python3 -m accelerate.commands.launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
   --dataset_path "\${LLAMA2_DATA_DIR}" \\
@@ -592,7 +598,7 @@ python3 -m accelerate.commands.launch --config_file configs/h200_4gpu.yaml scrip
   --bf16 True \\
   --logging_steps 24 \\
   --eval_steps ${llama2_eval_steps} \\
-  --output_dir "./results/llama-70b_scrolls_gov_report_r16_\${SEED}" \\
+  --output_dir "/tmp/llama2_results/llama-70b_scrolls_gov_report_r16_\${SEED}" \\
   --per_device_train_batch_size 1 \\
   --gradient_accumulation_steps 1 \\
   --lr_scheduler_type "cosine" \\

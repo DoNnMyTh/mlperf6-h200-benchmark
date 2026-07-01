@@ -443,21 +443,13 @@ echo "Resolved llama2_lora mode inside container: \${MLPERF_LLAMA2_MODE}"
 # mounted assets in place. Data dir is /tmp only when we prep it (non
 # official/local); model dir is /tmp whenever we download it (non official).
 LLAMA2_DATA_DIR="/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}"
+# The 70B model always comes from the persistent /models mount, staged once by the
+# unbounded prestage (download_llama2_lora). It is never downloaded inside this
+# time-boxed training container, so the ~130 GB fetch stays out of the quick-run
+# window. Only the small smoke dataset is prepared in-container (to /tmp).
 LLAMA2_MODEL_DIR="/models/\${LLAMA2_MODEL_SUBDIR}"
-if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
-  # Prefer a persistent, prestaged model under the /models mount: the
-  # download_llama2_lora prestage fetches the 70B there once as the host user (the
-  # training container root is squashed on lustre and cannot write /models), so
-  # reuse it across runs instead of re-downloading ~130 GB into ephemeral /tmp
-  # every --rm run. Fall back to a /tmp download only when nothing is prestaged.
-  if [[ -f "/models/\${LLAMA2_MODEL_SUBDIR}/config.json" ]]; then
-    LLAMA2_MODEL_DIR="/models/\${LLAMA2_MODEL_SUBDIR}"
-  else
-    LLAMA2_MODEL_DIR="/tmp/llama2_model/\${LLAMA2_MODEL_SUBDIR}"
-  fi
-  if [[ "\${MLPERF_LLAMA2_MODE}" != "local-only" ]]; then
-    LLAMA2_DATA_DIR="/tmp/llama2_data/\${LLAMA2_DATASET_SUBDIR}"
-  fi
+if [[ "\${MLPERF_LLAMA2_MODE}" != "official" && "\${MLPERF_LLAMA2_MODE}" != "local-only" ]]; then
+  LLAMA2_DATA_DIR="/tmp/llama2_data/\${LLAMA2_DATASET_SUBDIR}"
 fi
 echo "llama2 data dir: \${LLAMA2_DATA_DIR} | model dir: \${LLAMA2_MODEL_DIR}"
 # pip reports "normal site-packages is not writeable" and installs console
@@ -520,38 +512,17 @@ if [[ -n "\${HF_TOKEN:-}" ]]; then
   if [[ "\${HFC}" == "hf" ]]; then hf auth login --token "\${HF_TOKEN}" || true; else huggingface-cli login --token "\${HF_TOKEN}" || true; fi
 fi
 if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
-  # Download the public model for any non-official mode (local-only, smoke-test,
-  # and the unresolved "auto" the container sometimes receives). Gating on the
-  # exact strings skipped auto and failed with "model directory missing".
-  # Always invoke the downloader. huggingface-cli download resumes and only
-  # fetches missing files, so an earlier interrupted run that left an INCOMPLETE
-  # model directory is repaired instead of being wrongly treated as complete
-  # (the previous "dir exists -> skip" check produced a missing modeling_llama.py).
-  # The 70B model is ~128 GB. On this node the writer intermittently dies mid
-  # download (hf-xet "Background writer channel closed", then plain http_get
-  # "[Errno 14] Bad address" writing to lustre). Each attempt resumes and only
-  # fetches what is missing, so retry a few times with fewer parallel writers;
-  # this completes the remaining shards across attempts.
-  if [[ -f "\${LLAMA2_MODEL_DIR}/config.json" ]]; then
-    echo "Using existing model at \${LLAMA2_MODEL_DIR} (prestaged or previously downloaded); skipping download"
-  else
-    model_download_ok=0
-    for attempt in 1 2 3 4 5 6 7 8 9 10; do
-      if "\${HFC}" download "\${MLPERF_LLAMA2_PUBLIC_MODEL_ID}" --local-dir "\${LLAMA2_MODEL_DIR}" --max-workers 1; then
-        model_download_ok=1
-        break
-      fi
-      echo "llama2 model download attempt \${attempt} failed; resuming and retrying"
-      sleep 5
-    done
-    if [[ "\${model_download_ok}" -ne 1 ]]; then
-      echo "ERROR: llama2 model download did not complete after repeated attempts" >&2
-      exit 1
-    fi
+  # The 70B model is staged ONCE by the unbounded prestage stage
+  # (download_llama2_lora), never inside this time-boxed training container, so the
+  # ~130 GB fetch stays out of the quick-run window. Fail fast if it is not present
+  # rather than burning the window on a doomed in-container download.
+  if [[ ! -f "\${LLAMA2_MODEL_DIR}/config.json" ]]; then
+    echo "ERROR: 70B model not staged at \${LLAMA2_MODEL_DIR}. The prestage (download stage) must finish first -- it downloads the model outside the quick-run window. Re-run with HF_TOKEN set so the prestage can complete." >&2
+    exit 1
   fi
   for required in config.json modeling_llama.py model.safetensors.index.json; do
     if [[ ! -f "\${LLAMA2_MODEL_DIR}/\${required}" ]]; then
-      echo "ERROR: required model file still missing after download: \${LLAMA2_MODEL_DIR}/\${required}" >&2
+      echo "ERROR: required model file missing (incomplete prestage): \${LLAMA2_MODEL_DIR}/\${required}" >&2
       exit 1
     fi
   done

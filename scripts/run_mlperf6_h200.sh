@@ -490,12 +490,16 @@ else
   TORCH_CUDA_ARCH_LIST="9.0" MAX_JOBS=32 pip install flash-attn==2.1.0 --no-build-isolation \\
     || echo "flash-attn build failed; will run without it"
 fi
-# Use flash-attn only if it actually ended up importable. The HF trainer runs
-# without it (standard SDPA attention) -- slower, fine for a smoke-test/perf run.
-if python3 -c "import flash_attn" >/dev/null 2>&1; then
+# Use flash-attn only if a version transformers accepts (>=2.1.0) is importable.
+# The nvcr 23.09 image ships flash_attn 2.0.4, which transformers rejects for
+# FlashAttention2 ("need version >= 2.1.0. Detected 2.0.4"). A 2.1.0 source build
+# does not compile here (sm_90 / CUDA) and would run inside the window, so when
+# only an older flash-attn is present we run without it (SDPA), which is a valid
+# perf measurement. chr(46) avoids a literal dot so the payload stays quote-clean.
+if python3 -c "import flash_attn, sys; v=tuple(int(x) for x in flash_attn.__version__.split(chr(46))[:2]); sys.exit(0 if v >= (2,1) else 1)" >/dev/null 2>&1; then
   FA_FLAG="--use_flash_attn"
 else
-  echo "WARNING: flash-attn unavailable; running llama2 smoke-test without it"
+  echo "WARNING: flash-attn >=2.1.0 not available (image has an older build or none); running llama2 without it (SDPA)"
   FA_FLAG=""
 fi
 # Idempotent: a previous attempt in a reused image layer can leave this dir, so

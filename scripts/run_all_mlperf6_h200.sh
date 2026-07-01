@@ -427,8 +427,16 @@ for attempt in 1 2 3 4 5 6 7 8 9 10; do
   sleep 5
 done
 if [ "\${prestage_ok}" -ne 1 ]; then echo "ERROR: prestage model download failed after retries" >&2; exit 1; fi
-if [ ! -f /data_out/train-00000-of-00001.parquet ]; then
-  echo "Staging GovReport dataset -> local dataset dir"
+# Regenerate unless an already-TOKENIZED dataset is present. The old prep wrote a
+# raw input/output parquet, which train.py feeds straight to the Trainer -> the
+# Trainer drops both columns -> 0-row dataset -> "IndexError ... size 0". The new
+# metadata carries a "tokenized" marker; if it is absent (missing or stale raw
+# dataset), delete the stale parquet and re-stage in the tokenized+packed format.
+if grep -q tokenized /data_out/SMOKE_TEST_METADATA.json 2>/dev/null; then
+  echo "Reusing existing tokenized dataset at /data_out"
+else
+  echo "Staging GovReport dataset (tokenized+packed) -> local dataset dir"
+  rm -f /data_out/train-00000-of-00001.parquet /data_out/validation-00000-of-00001.parquet
   python3 /repo/scripts/prepare_llama2_lora_smoke_dataset.py --dataset-name "${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" --dataset-config "${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" --output-dir /data_out --tokenizer-path /model_out --block-size 8192 --train-samples "\${MLPERF_LLAMA2_PRESTAGE_TRAIN_SAMPLES:-8000}" --validation-samples "\${MLPERF_LLAMA2_PRESTAGE_VAL_SAMPLES:-970}"
 fi
 echo "llama2 prestage complete"
@@ -444,9 +452,14 @@ download_llama2_lora() {
   # reads for non-official modes (LLAMA2_MODEL_SUBDIR = PUBLIC_MODEL_DIRNAME), so
   # the training container finds it at /models/<dir> and skips the /tmp download.
   local model_local="${MLPERF_LLAMA2_MODEL_ROOT}/${MLPERF_LLAMA2_PUBLIC_MODEL_DIRNAME}"
-  # Already staged (dataset parquet + a non-empty model dir) -> nothing to do.
-  if [[ -f "${data_local}/train-00000-of-00001.parquet" && -d "${model_local}" && -n "$(ls -A "${model_local}" 2>/dev/null)" ]]; then
-    record_status "llama2_lora" "download" "skipped" "dataset+model already staged at ${data_local} and ${model_local}"
+  # Already staged -> nothing to do, but only when the dataset is the TOKENIZED
+  # format (marker in SMOKE_TEST_METADATA.json). A stale raw input/output parquet
+  # must NOT satisfy the skip, or training reloads it and dies with the 0-row
+  # "IndexError ... size 0"; leaving it unsatisfied re-runs the prestage, which
+  # regenerates the dataset tokenized and resumes/keeps the model.
+  if grep -q tokenized "${data_local}/SMOKE_TEST_METADATA.json" 2>/dev/null \
+     && [[ -d "${model_local}" && -n "$(ls -A "${model_local}" 2>/dev/null)" ]]; then
+    record_status "llama2_lora" "download" "skipped" "tokenized dataset+model already staged at ${data_local} and ${model_local}"
     return 0
   fi
   # With an HF login, auto-stage from HuggingFace to the local official paths.

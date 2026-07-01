@@ -448,7 +448,12 @@ LLAMA2_DATA_DIR="/workspace/dataset/\${LLAMA2_DATASET_SUBDIR}"
 # time-boxed training container, so the ~130 GB fetch stays out of the quick-run
 # window. Only the small smoke dataset is prepared in-container (to /tmp).
 LLAMA2_MODEL_DIR="/models/\${LLAMA2_MODEL_SUBDIR}"
-if [[ "\${MLPERF_LLAMA2_MODE}" != "official" && "\${MLPERF_LLAMA2_MODE}" != "local-only" ]]; then
+# Any non-official mode prepares the tokenized dataset in-container to /tmp (this
+# container has transformers + the model tokenizer), so training never depends on
+# a mounted prestaged dataset -- that path reloaded a stale/raw parquet and died
+# with the 0-row IndexError, and its local-only branch put the dataset on the
+# read-only lustre mount.
+if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
   LLAMA2_DATA_DIR="/tmp/llama2_data/\${LLAMA2_DATASET_SUBDIR}"
 fi
 echo "llama2 data dir: \${LLAMA2_DATA_DIR} | model dir: \${LLAMA2_MODEL_DIR}"
@@ -565,8 +570,7 @@ fi
 # and the run failed with "dataset parquet missing"). Keying off the missing
 # parquet + non-official/local mode covers smoke-test, auto, and empty.
 if [[ ! -f "\${LLAMA2_DATA_DIR}/train-00000-of-00001.parquet" \\
-      && "\${MLPERF_LLAMA2_MODE}" != "official" \\
-      && "\${MLPERF_LLAMA2_MODE}" != "local-only" ]]; then
+      && "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
   echo "Preparing public smoke dataset (parquet missing, mode=\${MLPERF_LLAMA2_MODE})"
   # Inline the prep so it never depends on a /repo helper file being present on
   # the host (a partial checkout left /repo/scripts/prepare_..._smoke_dataset.py

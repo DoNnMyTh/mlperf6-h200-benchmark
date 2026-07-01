@@ -427,10 +427,19 @@ for attempt in 1 2 3 4 5 6 7 8 9 10; do
   sleep 5
 done
 if [ "\${prestage_ok}" -ne 1 ]; then echo "ERROR: prestage model download failed after retries" >&2; exit 1; fi
+# The fused-qkv weights repo ships NO tokenizer files. Copy the standard Llama2
+# tokenizer into the model dir (best-effort across public repos) so the
+# in-container prep loads it locally with no in-window network. This runs as the
+# host user, which can write the lustre model dir; the training container root
+# cannot. Only fetch the small tokenizer files.
+if [ ! -f /model_out/tokenizer.json ]; then
+  for trepo in NousResearch/Llama-2-70b-hf NousResearch/Llama-2-7b-hf meta-llama/Llama-2-70b-hf; do
+    if "\${HFC}" download "\${trepo}" --include tokenizer.json tokenizer.model tokenizer_config.json special_tokens_map.json --local-dir /model_out; then break; fi
+  done
+fi
 # The dataset is prepared (tokenized+packed) inside the training container to /tmp
-# -- it has transformers and the model tokenizer -- so the prestage only stages
-# the 70B model. No dataset work here (avoids a failing prep deleting the parquet
-# and leaving training with none).
+# -- it has transformers, and now the tokenizer next to the model -- so the
+# prestage only stages the 70B model + tokenizer. No dataset work here.
 echo "llama2 prestage complete"
 '
 EOF
@@ -444,10 +453,11 @@ download_llama2_lora() {
   # reads for non-official modes (LLAMA2_MODEL_SUBDIR = PUBLIC_MODEL_DIRNAME), so
   # the training container finds it at /models/<dir> and skips the /tmp download.
   local model_local="${MLPERF_LLAMA2_MODEL_ROOT}/${MLPERF_LLAMA2_PUBLIC_MODEL_DIRNAME}"
-  # Prestage only stages the 70B model (the tokenized dataset is prepared inside
-  # the training container). Skip when the model is already staged.
-  if [[ -f "${model_local}/config.json" ]]; then
-    record_status "llama2_lora" "download" "skipped" "model already staged at ${model_local} (dataset prepared in-container)"
+  # Prestage stages the 70B model + the Llama2 tokenizer (the tokenized dataset is
+  # prepared inside the training container). Skip only when BOTH the model and the
+  # tokenizer are present -- otherwise re-run so the tokenizer gets copied in.
+  if [[ -f "${model_local}/config.json" && -f "${model_local}/tokenizer.json" ]]; then
+    record_status "llama2_lora" "download" "skipped" "model+tokenizer already staged at ${model_local} (dataset prepared in-container)"
     return 0
   fi
   # With an HF login, auto-stage from HuggingFace to the local official paths.

@@ -4,32 +4,66 @@ from __future__ import annotations
 
 import argparse
 import json
+from itertools import chain
 from pathlib import Path
 
-from datasets import load_dataset
+from datasets import Dataset, load_dataset
+from transformers import AutoTokenizer
 
 
-def trim_dataset(split, limit: int):
-    if limit <= 0:
-        return split
-    return split.select(range(min(limit, len(split))))
-
-
-def keep_required_columns(split):
-    keep = {"input", "output"}
-    drop = [column for column in split.column_names if column not in keep]
-    if drop:
-        split = split.remove_columns(drop)
-    return split
+def _build_split(split, limit: int, tokenizer, block_size: int, config: str):
+    if limit > 0:
+        split = split.select(range(min(limit, len(split))))
+    texts = []
+    for row in split:
+        if "gov_report" in config:
+            text = (
+                "### Summarize the following text:\n "
+                + str(row["input"])
+                + "\n ### Summary:\n "
+                + str(row["output"])
+                + (tokenizer.eos_token or "")
+            )
+        else:
+            text = (
+                "### "
+                + str(row["input"])
+                + "\n ### The answer is:\n "
+                + str(row["output"])
+                + (tokenizer.eos_token or "")
+            )
+        texts.append(text)
+    input_ids = tokenizer(texts).input_ids
+    flat = list(chain(*input_ids))
+    total = (len(flat) // block_size) * block_size
+    if total == 0:
+        raise SystemExit(
+            "prep produced fewer than one block of tokens; raise the sample count"
+        )
+    chunks = [flat[i : i + block_size] for i in range(0, total, block_size)]
+    return Dataset.from_dict(
+        {"input_ids": chunks, "labels": [list(c) for c in chunks]}
+    )
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(
-        description="Prepare a public smoke-test dataset for the Llama2 LoRA runner."
+        description=(
+            "Prepare a public smoke-test dataset for the Llama2 LoRA runner. "
+            "train.py loads the parquet straight into the HF Trainer with no "
+            "tokenizer, so it must already contain tokenized+packed "
+            "input_ids/labels (mirrors the reference create_datasets)."
+        )
     )
     parser.add_argument("--dataset-name", required=True)
     parser.add_argument("--dataset-config", required=True)
     parser.add_argument("--output-dir", required=True)
+    parser.add_argument(
+        "--tokenizer-path",
+        required=True,
+        help="Local model dir holding the Llama2 tokenizer (e.g. the prestaged model).",
+    )
+    parser.add_argument("--block-size", type=int, default=8192)
     parser.add_argument("--train-samples", type=int, default=128)
     parser.add_argument("--validation-samples", type=int, default=32)
     args = parser.parse_args()
@@ -37,10 +71,25 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    dataset = load_dataset(args.dataset_name, args.dataset_config, trust_remote_code=True)
-    train_split = keep_required_columns(trim_dataset(dataset["train"], args.train_samples))
-    validation_split = keep_required_columns(
-        trim_dataset(dataset["validation"], args.validation_samples)
+    tokenizer = AutoTokenizer.from_pretrained(
+        args.tokenizer_path, trust_remote_code=True
+    )
+    dataset = load_dataset(
+        args.dataset_name, args.dataset_config, trust_remote_code=True
+    )
+    train_split = _build_split(
+        dataset["train"],
+        args.train_samples,
+        tokenizer,
+        args.block_size,
+        args.dataset_config,
+    )
+    validation_split = _build_split(
+        dataset["validation"],
+        args.validation_samples,
+        tokenizer,
+        args.block_size,
+        args.dataset_config,
     )
 
     train_split.to_parquet(str(output_dir / "train-00000-of-00001.parquet"))
@@ -51,8 +100,10 @@ def main() -> int:
         "submission_valid": False,
         "dataset_name": args.dataset_name,
         "dataset_config": args.dataset_config,
-        "train_samples": len(train_split),
-        "validation_samples": len(validation_split),
+        "block_size": args.block_size,
+        "train_sequences": len(train_split),
+        "validation_sequences": len(validation_split),
+        "format": "tokenized+packed input_ids/labels",
         "note": "Public substitute dataset for local debugging only.",
     }
     (output_dir / "SMOKE_TEST_METADATA.json").write_text(
@@ -64,4 +115,3 @@ def main() -> int:
 
 if __name__ == "__main__":
     raise SystemExit(main())
-

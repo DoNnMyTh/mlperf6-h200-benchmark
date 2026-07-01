@@ -572,29 +572,46 @@ if [[ ! -f "\${LLAMA2_DATA_DIR}/train-00000-of-00001.parquet" \\
   # the host (a partial checkout left /repo/scripts/prepare_..._smoke_dataset.py
   # missing). Reads the smoke params from the env already forwarded into the
   # container. No single quotes and no dollar signs so it survives bash -lc.
+  # train.py loads the parquet straight into the HF Trainer with NO tokenizer, so
+  # the parquet must already hold tokenized+packed input_ids/labels (the reference
+  # scrolls_gov_report_8k dataset is preprocessed). A raw input/output parquet made
+  # the Trainer drop both columns (not in the model forward signature) -> a 0-row
+  # dataset -> "IndexError: Invalid key ... out of bounds for size 0". Mirror the
+  # reference create_datasets: build the gov_report prompt, tokenize with the model
+  # tokenizer, concatenate and chunk into block_size sequences, labels=input_ids.
+  # No single quotes / dollar signs so it survives the bash -lc + heredoc layers.
   cat > /tmp/prep_llama2_smoke.py <<PYEOF
-import sys
-from datasets import load_dataset
-name, config, out = sys.argv[1], sys.argv[2], sys.argv[3]
+import sys, os
+from itertools import chain
+from datasets import load_dataset, Dataset
+from transformers import AutoTokenizer
+name, config, out, model_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[6]
 ntr, nval = int(sys.argv[4]), int(sys.argv[5])
-import os
+block = int(sys.argv[7]) if len(sys.argv) > 7 else 8192
 os.makedirs(out, exist_ok=True)
+tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+eos = tok.eos_token or ""
 ds = load_dataset(name, config, trust_remote_code=True)
-def _prep(split, n):
+def build(split, n):
     if n > 0:
         split = split.select(range(min(n, len(split))))
-    keep = {"input", "output"}
-    drop = [c for c in split.column_names if c not in keep]
-    if drop:
-        split = split.remove_columns(drop)
-    return split
-_prep(ds["train"], ntr).to_parquet(out + "/train-00000-of-00001.parquet")
-_prep(ds["validation"], nval).to_parquet(out + "/validation-00000-of-00001.parquet")
-print("smoke dataset prepared at " + out)
+    texts = []
+    for row in split:
+        texts.append("### Summarize the following text:\n " + str(row["input"]) + "\n ### Summary:\n " + str(row["output"]) + eos)
+    ids = tok(texts).input_ids
+    flat = list(chain(*ids))
+    total = (len(flat) // block) * block
+    if total == 0:
+        raise SystemExit("prep produced fewer than one block of tokens; raise sample count")
+    chunks = [flat[i:i + block] for i in range(0, total, block)]
+    return Dataset.from_dict({"input_ids": chunks, "labels": [list(c) for c in chunks]})
+build(ds["train"], ntr).to_parquet(out + "/train-00000-of-00001.parquet")
+build(ds["validation"], nval).to_parquet(out + "/validation-00000-of-00001.parquet")
+print("tokenized+packed smoke dataset (block " + str(block) + ") prepared at " + out)
 PYEOF
-  # Pass params as argv (bash expands them, including the non-exported shell var
-  # LLAMA2_DATASET_SUBDIR that python os.environ could not see -> the KeyError).
-  python3 /tmp/prep_llama2_smoke.py "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" "\${LLAMA2_DATA_DIR}" "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES:-128}" "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES:-32}"
+  # Pass params as argv (bash expands them). argv 6 = model dir for the tokenizer,
+  # argv 7 = block size (matches --max_seq_len below).
+  python3 /tmp/prep_llama2_smoke.py "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" "\${LLAMA2_DATA_DIR}" "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES:-128}" "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES:-32}" "\${LLAMA2_MODEL_DIR}" 8192
 fi
 if [[ ! -f "\${LLAMA2_DATA_DIR}/train-00000-of-00001.parquet" ]]; then
   echo "ERROR: dataset parquet missing for resolved mode \${MLPERF_LLAMA2_MODE}" >&2

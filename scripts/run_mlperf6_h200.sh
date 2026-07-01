@@ -75,12 +75,12 @@ source "${ENV_FILE}"
 # When MLPERF_QUICK_RUN=1 each benchmark runs a time-boxed PERF window instead of
 # a full convergence run: eval is disabled, the step count is raised to a
 # generous ceiling, and the training launch is wrapped in `timeout` so it stops
-# after MLPERF_QUICK_RUN_SECONDS (default 300 = 5 min per benchmark). A timeout exit
+# after MLPERF_QUICK_RUN_SECONDS (default 600 = 10 min per benchmark). A timeout exit
 # (124) is treated as success -- the run captured a throughput/step-time sample,
 # not convergence. This yields hardware-performance numbers; it is NOT a valid
 # MLPerf submission result (no target-loss convergence).
 MLPERF_QUICK_RUN="${MLPERF_QUICK_RUN:-0}"
-MLPERF_QUICK_RUN_SECONDS="${MLPERF_QUICK_RUN_SECONDS:-300}"
+MLPERF_QUICK_RUN_SECONDS="${MLPERF_QUICK_RUN_SECONDS:-600}"
 # Step ceilings are intentionally high: with a sustained window the timeout is
 # the real bound, so these only stop a benchmark that is somehow faster than the
 # window. Override per benchmark via env if a step bound is preferred.

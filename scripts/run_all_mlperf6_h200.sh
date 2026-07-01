@@ -36,7 +36,7 @@ Options:
   --quick-run              Hardware-perf mode (DEFAULT): time-box each benchmark to
                            a short window (eval disabled) and report
                            throughput/step-time. NOT a valid MLPerf submission.
-  --quick-run-seconds N    Per-benchmark perf window in seconds (default 300).
+  --quick-run-seconds N    Per-benchmark perf window in seconds (default 600).
   --full                   Real convergence run (no time-box) instead of the
                            default hardware-perf mode. Use for a submission-style
                            run; takes hours per benchmark.

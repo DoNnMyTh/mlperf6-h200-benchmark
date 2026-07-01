@@ -34,6 +34,15 @@ ELAPSED_MS_RE = re.compile(r"elapsed time per iteration \(ms\):\s*" + _NUM)
 # throughput = batch_size / step. Matches NeMo "global_batch_size:" and Megatron
 # "global batch size:".
 GBS_RE = re.compile(r"global[_ ]batch[_ ]size:\s*([0-9]+)")
+# HF Trainer (llama2) emits NO throughput line mid-run -- a time-boxed quick-run
+# never reaches the end-of-train metrics. Its only per-step signal is the tqdm
+# training bar: "12/1000000 [01:48<..., 9.01s/it]" -> 9.01 s/step. Anchor on the
+# large max-steps denominator (>=1000 digits) so short bars that also print s/it
+# (e.g. "1/29 [.., 2.38s/it]" checkpoint-shard loading) are NOT mistaken for it.
+HF_STEP_RE = re.compile(r"/[0-9]{4,}\s*\[[^\]]*?" + _NUM + r"s/it")
+# MLLOG key/value form of the global batch size (llama2 emits it as JSON), e.g.
+# {"key": "global_batch_size", "value": 4}.
+GBS_MLLOG_RE = re.compile(r'"global_batch_size"\s*,\s*"value"\s*:\s*([0-9]+)')
 
 
 @dataclass
@@ -69,15 +78,32 @@ def _mean_tail(values: list[float], n: int = 50) -> float | None:
     return sum(tail) / len(tail)
 
 
+def _hf_tqdm_step_seconds(lines: list[str]) -> float | None:
+    """HF Trainer step time (seconds) parsed from its tqdm training bar. tqdm
+    rewrites one line with many updates, so findall all of them and average the
+    tail (the warmup steps are the first few, steady state is the tail)."""
+    secs: list[float] = []
+    for line in lines:
+        for token in HF_STEP_RE.findall(line):
+            try:
+                secs.append(float(token))
+            except ValueError:
+                pass
+    return _mean_tail(secs)
+
+
 def _mean_step_seconds(lines: list[str]) -> float | None:
     """Mean per-step time in seconds: an explicit step-time (s) if present, else
-    Megatron's elapsed-time-per-iteration (ms) converted to seconds."""
+    Megatron's elapsed-time-per-iteration (ms), else the HF Trainer tqdm rate."""
     step = _mean_tail(_collect(STEPTIME_RES, lines))
     if step:
         return step
     ms = _mean_tail(_collect([ELAPSED_MS_RE], lines))
     if ms:
         return ms / 1000.0
+    hf = _hf_tqdm_step_seconds(lines)
+    if hf:
+        return hf
     return None
 
 
@@ -91,7 +117,7 @@ def mean_throughput(lines: list[str] | None) -> float | None:
     if direct:
         return direct
     step = _mean_step_seconds(lines)
-    gbs = _collect([GBS_RE], lines)
+    gbs = _collect([GBS_RE, GBS_MLLOG_RE], lines)
     if step and step > 0 and gbs:
         return gbs[-1] / step
     return None
@@ -206,9 +232,19 @@ def inspect_log(log_path: Path | None, lines: list[str] | None) -> tuple[str, st
     status = "log-found"
     notes = f"Latest log: {log_path}"
 
-    # A quick-run perf window is stopped by timeout, so it never emits a
-    # convergence RESULT/run_stop; flag it so the status reads as perf-only.
-    quick = any("quick-run: sustained perf window" in line for line in lines)
+    # A quick-run perf window is stopped by the watchdog, so it never emits a
+    # convergence RESULT/run_stop; flag it so the status reads as perf-only. Match
+    # the actual watchdog messages ("quick-run: ... window reached", "treating as
+    # success") rather than a string the runner never prints.
+    quick = any(
+        "quick-run:" in line
+        and (
+            "window reached" in line
+            or "perf window" in line
+            or "treating as success" in line
+        )
+        for line in lines
+    )
 
     for line in lines:
         match = RESULT_RE.match(line.strip())

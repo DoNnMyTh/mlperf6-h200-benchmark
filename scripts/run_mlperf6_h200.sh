@@ -593,7 +593,19 @@ name, config, out, model_dir = sys.argv[1], sys.argv[2], sys.argv[3], sys.argv[6
 ntr, nval = int(sys.argv[4]), int(sys.argv[5])
 block = int(sys.argv[7]) if len(sys.argv) > 7 else 8192
 os.makedirs(out, exist_ok=True)
-tok = AutoTokenizer.from_pretrained(model_dir, trust_remote_code=True)
+def load_tok(md):
+    try:
+        from transformers import LlamaTokenizerFast
+        return LlamaTokenizerFast.from_pretrained(md)
+    except Exception:
+        pass
+    try:
+        from transformers import LlamaTokenizer
+        return LlamaTokenizer.from_pretrained(md)
+    except Exception:
+        pass
+    return AutoTokenizer.from_pretrained(md, use_fast=True)
+tok = load_tok(model_dir)
 eos = tok.eos_token or ""
 ds = load_dataset(name, config, trust_remote_code=True)
 def build(split, n):

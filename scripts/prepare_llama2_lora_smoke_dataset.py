@@ -11,6 +11,25 @@ from datasets import Dataset, load_dataset
 from transformers import AutoTokenizer
 
 
+def _load_tokenizer(path):
+    # The MLPerf fused-qkv model ships a custom config (CustomLlamaConfig) that
+    # AutoTokenizer cannot map to a tokenizer class, so load the standard Llama2
+    # tokenizer directly (reads tokenizer.json/.model, ignores the model config).
+    try:
+        from transformers import LlamaTokenizerFast
+
+        return LlamaTokenizerFast.from_pretrained(path)
+    except Exception:
+        pass
+    try:
+        from transformers import LlamaTokenizer
+
+        return LlamaTokenizer.from_pretrained(path)
+    except Exception:
+        pass
+    return AutoTokenizer.from_pretrained(path, use_fast=True)
+
+
 def _build_split(split, limit: int, tokenizer, block_size: int, config: str):
     if limit > 0:
         split = split.select(range(min(limit, len(split))))
@@ -71,9 +90,7 @@ def main() -> int:
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    tokenizer = AutoTokenizer.from_pretrained(
-        args.tokenizer_path, trust_remote_code=True
-    )
+    tokenizer = _load_tokenizer(args.tokenizer_path)
     dataset = load_dataset(
         args.dataset_name, args.dataset_config, trust_remote_code=True
     )

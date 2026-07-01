@@ -427,7 +427,7 @@ set -euo pipefail
 # "Internal Writer Error: Background writer channel closed" while resuming the
 # 70B model. Plain HTTPS download is slower but resumes reliably.
 export HF_HUB_DISABLE_XET=1
-# The accelerated hf_transfer (rust) writer intermittently dies on this node's
+# The accelerated hf_transfer (rust) writer intermittently dies on the node
 # lustre mount with "[Errno 14] Bad address" mid-download of the 70B shards.
 # Disable it so writes go through plain Python http_get, which resumes reliably.
 export HF_HUB_ENABLE_HF_TRANSFER=0
@@ -590,38 +590,6 @@ SEED="${MLPERF_LLAMA2_SEED}"
 # (checkpoints) goes to /tmp for the same reason.
 export COMPLIANCE_FILE=/tmp/mlperf_compliance.log
 mkdir -p /tmp/llama2_results
-# deepspeed (pinned old by requirements.txt) imports a module-level log symbol
-# from torch.distributed.elastic.agent.server.api, but torch >=2.4 renamed it to
-# logger, so import deepspeed dies with "cannot import name log". Add a back-compat
-# log alias (idempotent, non-fatal). Patch the torch module file because deepspeed
-# binds the name at import time; if torch is a non-writable system path, fall back
-# to rewriting deepspeed elastic_agent.py under the user site (writable).
-cat > /tmp/patch_ds_log.py <<PYEOF
-import io, os, sys, glob
-import torch.distributed.elastic.agent.server.api as m
-p = m.__file__
-if hasattr(m, "log"):
-    sys.exit(0)
-add = "\ntry:\n    log\nexcept NameError:\n    try:\n        log = logger\n    except NameError:\n        import logging as _l\n        log = _l.getLogger(__name__)\n"
-try:
-    if "log = logger" not in io.open(p, "r", encoding="utf-8").read():
-        io.open(p, "a", encoding="utf-8").write(add)
-    print("patched torch api for deepspeed log alias: " + p)
-    sys.exit(0)
-except OSError as e:
-    print("torch api not writable (" + str(e) + "); patching deepspeed elastic_agent.py")
-old = "from torch.distributed.elastic.agent.server.api import log, _get_socket_with_port"
-new = "try:\n    from torch.distributed.elastic.agent.server.api import log, _get_socket_with_port\nexcept ImportError:\n    from torch.distributed.elastic.agent.server.api import _get_socket_with_port\n    try:\n        from torch.distributed.elastic.agent.server.api import logger as log\n    except ImportError:\n        import logging as _l2\n        log = _l2.getLogger(__name__)"
-cands = []
-for base in [os.path.expanduser("~/.local"), "/usr/local/lib64", "/usr/local/lib"]:
-    cands += glob.glob(base + "/**/deepspeed/elasticity/elastic_agent.py", recursive=True)
-for f in cands:
-    s = io.open(f, "r", encoding="utf-8").read()
-    if old in s:
-        io.open(f, "w", encoding="utf-8").write(s.replace(old, new))
-        print("patched deepspeed elastic_agent.py: " + f)
-PYEOF
-python3 /tmp/patch_ds_log.py || echo "log-alias patch step skipped (non-fatal)"
 # Use the module form so it works whether accelerate is on PATH or only importable.
 python3 -m accelerate.commands.launch --config_file configs/h200_4gpu.yaml scripts/train.py \\
   --dataset_path "\${LLAMA2_DATA_DIR}" \\
@@ -697,12 +665,18 @@ export MASTER_PORT=29501
 # is passed through. Verified against the upstream run_with_docker.sh.
 export CUDA_DEVICE_MAX_CONNECTIONS=1
 export NCCL_DEBUG=WARN
-# The 20B MoE runs right at the 140 GiB H200 limit and OOM'd in the expert
-# forward (~131 GiB allocated, only ~389 MiB free). expandable_segments recovers
-# reserved-but-unallocated fragmentation, which the allocator itself recommends.
-# NOTE: this is a thin margin -- if it still OOMs, the real fix is a distributed
-# optimizer / more model parallelism (TP>1) to shard optimizer state.
-export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True
+# The 20B MoE runs right at the 140 GiB H200 limit. It trained ~40 iters then
+# OOM'd in the vocab cross-entropy fp32 upcast (vocab_parallel_logits.float(),
+# tried ~3.9 GiB) when only ~3.8 GiB was free -- ~1 GiB of that gap was
+# reserved-but-unallocated fragmentation, so this is a fragmentation OOM, not a
+# hard capacity wall. expandable_segments recovers that fragmentation, and
+# garbage_collection_threshold:0.8 makes the allocator proactively release cached
+# blocks once reserved exceeds 80% of capacity, so the per-step CE peak fits
+# instead of tipping over. Both are native PyTorch allocator knobs (no Primus
+# dependency). NOTE: still a thin margin -- if it OOMs again, the next levers are
+# a distributed optimizer (shard optimizer state across the 4 DP ranks) or a
+# shorter seq_length (shrinks the vocab-logits CE peak directly).
+export PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True,garbage_collection_threshold:0.8
 
 export PRIMUS_PATH=/workspace/deps/Primus
 export PYTHONPATH="\${PRIMUS_PATH}:\${PRIMUS_PATH}/third_party/Megatron-LM:\${PYTHONPATH:-}"

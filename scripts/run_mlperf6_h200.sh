@@ -333,13 +333,22 @@ EOF
 }
 
 render_llama2_lora() {
-  # Step/eval bounds. Full run keeps the smoke-test cap (1024); quick-run raises
-  # the cap (timeout bounds wall-clock) and disables periodic eval.
-  local llama2_max_steps="1024"
+  # Quick-run: a tiny SMOKE subset (throughput only), high step cap (the watchdog
+  # bounds wall-clock), eval disabled. Full run: the WHOLE GovReport set (needed to
+  # converge -- a subset overfits: train_loss -> ~0.02 while eval_loss diverges
+  # 1.15 -> 2.46), with periodic eval. Quick and full prep into SEPARATE /tmp
+  # folders (data tag) so switching modes never reuses the wrong dataset.
+  local llama2_max_steps="${MLPERF_LLAMA2_FULL_STEPS:-1024}"
   local llama2_eval_steps="48"
+  local llama2_train_samples="${MLPERF_LLAMA2_FULL_TRAIN_SAMPLES:-0}"
+  local llama2_val_samples="${MLPERF_LLAMA2_FULL_VAL_SAMPLES:-0}"
+  local llama2_data_tag="full"
   if [[ "${MLPERF_QUICK_RUN}" == "1" ]]; then
     llama2_max_steps="${MLPERF_QUICK_LLAMA2_STEPS}"
     llama2_eval_steps="${MLPERF_QUICK_EVAL_DISABLE}"
+    llama2_train_samples="${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES:-128}"
+    llama2_val_samples="${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES:-32}"
+    llama2_data_tag="quick"
   fi
   cat <<EOF
 set -euo pipefail
@@ -454,7 +463,7 @@ LLAMA2_MODEL_DIR="/models/\${LLAMA2_MODEL_SUBDIR}"
 # with the 0-row IndexError, and its local-only branch put the dataset on the
 # read-only lustre mount.
 if [[ "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
-  LLAMA2_DATA_DIR="/tmp/llama2_data/\${LLAMA2_DATASET_SUBDIR}"
+  LLAMA2_DATA_DIR="/tmp/llama2_data/\${LLAMA2_DATASET_SUBDIR}-${llama2_data_tag}"
 fi
 echo "llama2 data dir: \${LLAMA2_DATA_DIR} | model dir: \${LLAMA2_MODEL_DIR}"
 # pip reports "normal site-packages is not writeable" and installs console
@@ -640,7 +649,7 @@ PYEOF
   python3 -m pip install -q sentencepiece >/dev/null 2>&1 || true
   # Pass params as argv (bash expands them). argv 6 = model dir for the tokenizer,
   # argv 7 = block size (matches --max_seq_len below).
-  python3 /tmp/prep_llama2_smoke.py "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" "\${LLAMA2_DATA_DIR}" "\${MLPERF_LLAMA2_SMOKE_TRAIN_SAMPLES:-128}" "\${MLPERF_LLAMA2_SMOKE_VAL_SAMPLES:-32}" "\${LLAMA2_MODEL_DIR}" 8192
+  python3 /tmp/prep_llama2_smoke.py "\${MLPERF_LLAMA2_SMOKE_DATASET_NAME}" "\${MLPERF_LLAMA2_SMOKE_DATASET_CONFIG}" "\${LLAMA2_DATA_DIR}" "${llama2_train_samples}" "${llama2_val_samples}" "\${LLAMA2_MODEL_DIR}" 8192
 fi
 if [[ ! -f "\${LLAMA2_DATA_DIR}/train-00000-of-00001.parquet" ]]; then
   echo "ERROR: dataset parquet missing for resolved mode \${MLPERF_LLAMA2_MODE}" >&2
@@ -865,9 +874,13 @@ EOF
 render_flux() {
   # In quick-run, cap steps high and push eval out past the window (the timeout
   # bounds wall-clock). One line so the surrounding \-continuation stays valid.
-  local flux_quick_args=""
+  # Quick-run: high step cap + eval pushed past the window (throughput only). Full
+  # run: a convergence-sized step budget (the config default ~30k steps is far too
+  # short -- FLUX needs ~15.8M samples), with eval left enabled so it can reach
+  # target. One line so the surrounding \-continuation stays valid.
+  local flux_step_args="--training.steps=${MLPERF_FLUX_FULL_STEPS}"
   if [[ "${MLPERF_QUICK_RUN}" == "1" ]]; then
-    flux_quick_args="--training.steps=${MLPERF_QUICK_FLUX_STEPS} --eval.eval_freq=${MLPERF_QUICK_EVAL_DISABLE}"
+    flux_step_args="--training.steps=${MLPERF_QUICK_FLUX_STEPS} --eval.eval_freq=${MLPERF_QUICK_EVAL_DISABLE}"
   fi
   cat <<EOF
 set -euo pipefail
@@ -897,7 +910,7 @@ NGPU="${MLPERF_GPU_COUNT}" \\
   --training.dataset_path=/dataset/cc12m_preprocessed \\
   --eval.dataset_path=/dataset/coco_preprocessed \\
   --encoder.empty_encodings_path=/dataset/empty_encodings \\
-  ${flux_quick_args} \\
+  ${flux_step_args} \\
   --training.seed=${MLPERF_FLUX_SEED}
 '$(quick_timeout_suffix mlperf-flux)
 EOF

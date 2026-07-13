@@ -106,7 +106,7 @@ git push
 
 ## H200 benchmark toolkit
 
-For the 4x H200 host profile captured from `t3ihpc07`, this repository now
+For the 4x H200 host profile captured from `cluster`, this repository now
 includes a local benchmark toolkit:
 
 - `configs/mlperf6-h200-4gpu.env`: editable paths and defaults for the H200 node

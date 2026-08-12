@@ -24,7 +24,7 @@ Benchmarks:
 Options:
   --quick-run            Hardware-perf mode: time-box the benchmark to a short
                          sustained window (eval off) instead of full convergence.
-  --quick-run-seconds N  Perf window seconds (default 300). Implies --quick-run.
+  --quick-run-seconds N  Perf window seconds (default 3600). Implies --quick-run.
 
 Notes:
   - `show` prints the exact commands without running them.

@@ -427,7 +427,6 @@ $(quick_timeout_prefix mlperf-llama2)docker run --rm --name mlperf-llama2 --gpus
   -v "${MLPERF_LLAMA2_RESULTS_PATH}:/workspace/results" \\
   -v "${MLPERF_LLAMA2_MODEL_ROOT}:/models" \\
   -v "${MLPERF_HF_CACHE}:/root/.cache/huggingface" \\
-  -v "${REPO_ROOT}:/repo" \\
   -w /workspace \\
   "${MLPERF_LLAMA2_DOCKER_IMAGE}" \\
   bash -lc '
@@ -581,10 +580,12 @@ fi
 if [[ ! -f "\${LLAMA2_DATA_DIR}/train-00000-of-00001.parquet" \\
       && "\${MLPERF_LLAMA2_MODE}" != "official" ]]; then
   echo "Preparing public smoke dataset (parquet missing, mode=\${MLPERF_LLAMA2_MODE})"
-  # Inline the prep so it never depends on a /repo helper file being present on
-  # the host (a partial checkout left /repo/scripts/prepare_..._smoke_dataset.py
-  # missing). Reads the smoke params from the env already forwarded into the
-  # container. No single quotes and no dollar signs so it survives bash -lc.
+  # Inline the prep so it never depends on a host-side helper file being present
+  # (a partial checkout once left the mounted prepare_..._smoke_dataset.py
+  # missing). That standalone helper and the /repo mount that reached it are both
+  # gone; this inline copy is the only prep path. Reads the smoke params from the
+  # env already forwarded into the container. No single quotes and no dollar
+  # signs so it survives bash -lc.
   # train.py loads the parquet straight into the HF Trainer with NO tokenizer, so
   # the parquet must already hold tokenized+packed input_ids/labels (the reference
   # scrolls_gov_report_8k dataset is preprocessed). A raw input/output parquet made
@@ -594,7 +595,7 @@ if [[ ! -f "\${LLAMA2_DATA_DIR}/train-00000-of-00001.parquet" \\
   # tokenizer, concatenate and chunk into block_size sequences, labels=input_ids.
   # No single quotes / dollar signs so it survives the bash -lc + heredoc layers.
   cat > /tmp/prep_llama2_smoke.py <<PYEOF
-import sys, os
+import sys, os, json
 from itertools import chain
 from datasets import load_dataset, Dataset
 from transformers import AutoTokenizer
@@ -640,9 +641,25 @@ def build(split, n):
         raise SystemExit("prep produced fewer than one block of tokens; raise sample count")
     chunks = [flat[i:i + block] for i in range(0, total, block)]
     return Dataset.from_dict({"input_ids": chunks, "labels": [list(c) for c in chunks]})
-build(ds["train"], ntr).to_parquet(out + "/train-00000-of-00001.parquet")
-build(ds["validation"], nval).to_parquet(out + "/validation-00000-of-00001.parquet")
-print("tokenized+packed smoke dataset (block " + str(block) + ") prepared at " + out)
+tr = build(ds["train"], ntr)
+va = build(ds["validation"], nval)
+tr.to_parquet(out + "/train-00000-of-00001.parquet")
+va.to_parquet(out + "/validation-00000-of-00001.parquet")
+# Mark the directory as a PUBLIC SUBSTITUTE, not MLCommons-gated data, so a
+# prepared dataset can never be mistaken for official submission input. Applies
+# to both the quick smoke subset and the full-sample prep (same public source).
+json.dump({
+    "source": "public substitute (" + name + "/" + config + ")",
+    "submission_valid": False,
+    "block_size": block,
+    "train_samples_requested": ntr,
+    "validation_samples_requested": nval,
+    "train_sequences": len(tr),
+    "validation_sequences": len(va),
+    "format": "tokenized+packed input_ids/labels",
+    "note": "Public substitute dataset for local debugging/perf only.",
+}, open(out + "/SMOKE_TEST_METADATA.json", "w"), indent=2)
+print("tokenized+packed dataset (block " + str(block) + ") prepared at " + out)
 PYEOF
   # sentencepiece backs the LlamaTokenizer(vocab_file=tokenizer.model) fallback
   # (used only if the model ships no tokenizer.json); best-effort, non-fatal.

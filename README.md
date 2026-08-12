@@ -1,11 +1,11 @@
 # MLPerf 6.0 H200 Benchmark Bootstrap
 
-This repository is the staging area for an MLPerf 6.0 benchmark run on a Linux
-server with 4x NVIDIA H200 GPUs.
+This repository drives an MLPerf 6.0 benchmark run on a Linux server with
+4x NVIDIA H200 GPUs. It bootstraps the upstream MLCommons reference code,
+downloads each benchmark's assets, runs the benchmarks, and writes one report.
 
-The first phase is system discovery. We capture a benchmark-oriented hardware
-and software snapshot, review it, and use that output to build the benchmark
-runner and final report in the next phase.
+The target host profile (`t3ihpc07`) is already captured in
+`configs/mlperf6-h200-4gpu.env`; edit that file to retarget another node.
 
 ## Target benchmark areas
 
@@ -16,16 +16,14 @@ runner and final report in the next phase.
 
 ## Repository layout
 
-- `scripts/collect_system_config.sh`: captures a Linux server snapshot into `artifacts/system/`
-- `scripts/commit_system_snapshot.sh`: runs the collector and creates a local git commit for that snapshot
-- `artifacts/system/`: committed system snapshots used to drive the next automation step
+- `configs/mlperf6-h200-4gpu.env`: all paths, image tags, dataset URIs, and run defaults
+- `scripts/`: the benchmark toolkit (see "H200 benchmark toolkit" below)
+- `generated/`: local report output (git-ignored)
 
 ## Safety notes
 
-- Review every generated snapshot before pushing it to a public repository.
-- The collector intentionally avoids broad environment dumps and IP address collection.
-- Host labels, PCIe layout, package versions, driver versions, and GPU topology can still be sensitive.
-- The commit helper never pushes and refuses to run when the repo is already dirty.
+- Run output, downloaded data, and reports stay outside version control (`generated/`, `results/`, `work/`, `artifacts/` are git-ignored).
+- Host labels, PCIe layout, package versions, driver versions, and GPU topology can be sensitive. Review anything you publish from this repo.
 
 ## Bootstrap commands
 
@@ -47,67 +45,10 @@ gh repo create DoNnMyTh/mlperf6-h200-benchmark \
 git push -u origin main
 ```
 
-## Collect a system snapshot on the target Linux server
-
-From the repository root:
-
-```bash
-chmod +x scripts/*.sh
-./scripts/collect_system_config.sh
-```
-
-The collector prints the created snapshot directory, for example:
-
-```text
-artifacts/system/my-host-20260627T120000Z
-```
-
-Review the generated files before committing or publishing them.
-
-## Collect and create a local commit for the snapshot
-
-After the bootstrap commit exists and the repo is clean:
-
-```bash
-./scripts/commit_system_snapshot.sh
-```
-
-This helper:
-
-- verifies the repository is clean before it starts
-- runs the collector
-- stages only the new snapshot directory
-- creates a local commit
-- never pushes
-
-To publish the reviewed snapshot later:
-
-```bash
-git push
-```
-
-## What the collector captures
-
-- OS release and kernel details
-- CPU topology and memory inventory
-- block devices, mounts, and filesystem capacity
-- PCIe device inventory
-- GPU inventory, driver details, and `nvidia-smi topo -m`
-- InfiniBand and RDMA details when available
-- container/runtime/toolchain versions when available
-- a small allowlist of benchmark-relevant environment variables
-- a manifest of which commands were present, missing, or failed
-
-## What the collector avoids
-
-- full `env` output
-- IP address dumps
-- automatic uploads or pushes
-
 ## H200 benchmark toolkit
 
-For the 4x H200 host profile captured from `cluster`, this repository now
-includes a local benchmark toolkit:
+For the 4x H200 host profile captured from `cluster`, this repository provides
+a local benchmark toolkit:
 
 - `configs/mlperf6-h200-4gpu.env`: editable paths and defaults for the H200 node
 - `scripts/bootstrap_mlperf6_h200.sh`: clones or updates the official `mlcommons/training` repo with the required submodule

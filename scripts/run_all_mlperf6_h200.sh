@@ -406,7 +406,6 @@ docker run --rm --user ${uid}:${gid} \\
   -e HF_TOKEN="\${HF_TOKEN:-}" \\
   -v "${model_local}:/model_out" \\
   -v "${data_local}:/data_out" \\
-  -v "${REPO_ROOT}:/repo:ro" \\
   "${img}" bash -lc '
 set -euo pipefail
 export HOME=/tmp HF_HOME=/tmp/hf_home HF_HUB_DISABLE_XET=1 HF_HUB_ENABLE_HF_TRANSFER=0

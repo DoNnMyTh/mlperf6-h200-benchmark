@@ -181,15 +181,48 @@ def registry_save(entries: List[dict]) -> None:
         print(f"warning: could not write registry {registry_path()}: {exc}", file=sys.stderr)
 
 
+class _RegistryLock:
+    """Serialises read-modify-write of active.json across concurrent starts (POSIX flock)."""
+
+    def __init__(self) -> None:
+        self._fh = None
+
+    def __enter__(self) -> "_RegistryLock":
+        if os.name != "posix":
+            return self
+        try:
+            import fcntl
+
+            registry_path().parent.mkdir(parents=True, exist_ok=True)
+            self._fh = open(registry_path().with_suffix(".lock"), "a+")
+            fcntl.flock(self._fh.fileno(), fcntl.LOCK_EX)
+        except (OSError, ImportError):
+            self._fh = None
+        return self
+
+    def __exit__(self, *_exc) -> None:
+        if self._fh is not None:
+            try:
+                import fcntl
+
+                fcntl.flock(self._fh.fileno(), fcntl.LOCK_UN)
+            except (OSError, ImportError):
+                pass
+            self._fh.close()
+            chown_to_sudo_user(registry_path().with_suffix(".lock"))
+
+
 def registry_add(run_dir: Path, pid: int, label: str) -> None:
-    entries = [e for e in registry_load() if e.get("run_dir") != str(run_dir)]
-    entries.append({"run_dir": str(run_dir), "pid": pid, "label": label, "started_at": _stamp()})
-    registry_save(entries)
+    with _RegistryLock():
+        entries = [e for e in registry_load() if e.get("run_dir") != str(run_dir)]
+        entries.append({"run_dir": str(run_dir), "pid": pid, "label": label, "started_at": _stamp()})
+        registry_save(entries)
 
 
 def registry_prune() -> List[dict]:
-    kept = [e for e in registry_load() if Path(str(e.get("run_dir", ""))).is_dir()]
-    registry_save(kept)
+    with _RegistryLock():
+        kept = [e for e in registry_load() if Path(str(e.get("run_dir", ""))).is_dir()]
+        registry_save(kept)
     return kept
 
 
@@ -279,7 +312,11 @@ def _run_recorder(cfg: RunConfig, logger, install_signals: bool) -> int:
     cfg.path.mkdir(parents=True, exist_ok=True)
     (cfg.path / PID_FILE).write_text(str(os.getpid()), encoding="utf-8")
     cfg.save()
-    return rec.run()
+    rc = rec.run()
+    # The final status.json is written after the report finalizer ran; hand
+    # that last file back to the sudo user too.
+    chown_to_sudo_user(cfg.path, recursive=True)
+    return rc
 
 
 def _finalize_report(run_dir: Path, plots: str, logger) -> None:
@@ -540,13 +577,13 @@ def wizard(args: argparse.Namespace) -> int:
     while True:
         out_txt = ask("Output folder", DEFAULT_OUT)
         out = Path(out_txt).expanduser().resolve()
-        if not out.exists():
-            if not ask_yes_no(f"{out} does not exist. Create it?", True):
-                continue
+        existed = out.exists()
         problem = check_out_dir(out, create=True)
         if problem:
             print(f"  {problem}")
             continue
+        if not existed:
+            print(f"  created {out}")
         break
     warn = free_space_warning(out)
     if warn:
@@ -659,9 +696,9 @@ def stop_run(run_dir: Path, timeout: float) -> int:
     deadline = time.monotonic() + timeout
     while time.monotonic() < deadline:
         status = read_status(run_dir)
-        if status and status.get("final") and (run_dir / report.REPORT_MD).exists():
-            break
-        if not pid_alive(pid):
+        # `final` is only set after the report is written; the process going
+        # away covers a worker that died without finalizing.
+        if (status and status.get("final")) or not pid_alive(pid):
             break
         time.sleep(0.2)
     else:

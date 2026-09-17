@@ -183,6 +183,14 @@ docker build -f tools/powermon/Dockerfile.test --build-arg WITH_MPL=0 -t powermo
 docker build -f tools/powermon/Dockerfile.test --build-arg PYTHON_VERSION=3.12 -t powermon-test-312 tools/powermon && docker run --rm powermon-test-312
 ```
 
+## Host scenario battery
+
+`bash tools/powermon/tests/scenarios.sh` on a Linux host (passwordless sudo)
+runs ~45 end-to-end checks against real sensors: wizard through a pseudo-tty,
+concurrent runs, `stop --all`, partial-CSV reports, unicode marks, exit codes,
+SIGINT/SIGKILL handling, sudo start followed by unprivileged use, and the
+`run_all --powermon` hook with a stub benchmark. Everything lands under `/tmp`.
+
 ## Troubleshooting
 
 | Symptom | Cause and fix |

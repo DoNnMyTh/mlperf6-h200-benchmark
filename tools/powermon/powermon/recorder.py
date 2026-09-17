@@ -244,6 +244,12 @@ class Recorder:
             self._write_sensors()
         except OSError as exc:
             self.log(f"cannot create run files in {self.run_dir}: {exc}")
+            if self._fh is not None:
+                try:
+                    self._fh.close()
+                except OSError:
+                    pass
+                self._fh = None
             self.state = STATE_ERROR
             self.exit_code = 2
             self.write_status(final=True)
@@ -309,9 +315,13 @@ class Recorder:
                 pass
         self._elapsed = self.clock.monotonic() - self._t0 if self._t0 else self._elapsed
         self.log(f"finished: state={self.state} samples={self.samples} gaps={self.gaps}")
-        self.write_status(final=True)
+        # Publish the terminal state first (so the report can show it), build
+        # the report, and only then flip `final` so `status`/`stop` never see a
+        # finished run whose report is still being written.
+        self.write_status(final=False)
         if self.finalizer is not None:
             try:
                 self.finalizer(self.run_dir)
             except Exception as exc:  # noqa: BLE001 - report failure must not lose the CSV
                 self.log(f"report generation failed: {exc!r}")
+        self.write_status(final=True)

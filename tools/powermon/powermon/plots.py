@@ -109,7 +109,7 @@ def build_charts(summary: Summary) -> List[Chart]:
         if len(ch.series) > MAX_SERIES:
             # Keep the hottest / highest series so the interesting ones survive.
             total = len(ch.series)
-            ranked = sorted(ch.series, key=lambda s: max(v for v in s.values if not math.isnan(v)), reverse=True)
+            ranked = sorted(ch.series, key=lambda s: max((v for v in s.values if not math.isnan(v)), default=float("-inf")), reverse=True)
             keep = {s.name for s in ranked[:MAX_SERIES]}
             ch.series = [s for s in ch.series if s.name in keep]
             ch.note = f"showing {MAX_SERIES} highest of {total} series"

@@ -10,6 +10,18 @@ instead of the built-in SVG charts).
 
 ## Quick start
 
+Easiest: the launcher in the parent folder. First run creates
+`tools/powermon/.venv` and installs matplotlib into it; later runs reuse it.
+Every powermon argument passes straight through.
+
+```bash
+./tools/powermon.sh                  # interactive wizard (installs deps first time)
+./tools/powermon.sh start -d 30m -o /data/power --yes
+./tools/powermon.sh status
+```
+
+Without the launcher (no dependencies needed, graphs fall back to SVG):
+
 ```bash
 cd tools/powermon
 python3 powermon.py            # interactive wizard

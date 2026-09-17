@@ -20,6 +20,7 @@ The target host profile (`t3ihpc07`) is already captured in
 - `scripts/`: the benchmark toolkit (see "H200 benchmark toolkit" below)
 - `generated/`: local report output (git-ignored)
 - `tools/powermon/`: standalone Linux power/temperature recorder (CSV + graphs + report); see [tools/powermon/README.md](tools/powermon/README.md)
+- `tools/powermon.sh`: one-shot launcher for powermon (installs its optional dependency, then starts it): `./tools/powermon.sh`
 
 ## Safety notes
 

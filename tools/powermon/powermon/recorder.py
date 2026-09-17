@@ -27,6 +27,8 @@ STATUS_JSON = "status.json"
 RUN_JSON = "run.json"
 WORKER_LOG = "worker.log"
 PID_FILE = "powermon.pid"
+EVENTS_CSV = "events.csv"
+SUMMARY_JSON = "summary.json"
 
 STATE_RUNNING = "running"
 STATE_DONE = "done"
@@ -48,6 +50,7 @@ class RunConfig:
     fsync_every: int = 60
     demo: bool = False
     plots: str = "auto"  # auto | png | svg
+    per_core: bool = True  # record per-core coretemp inputs
     started_at: str = ""
 
     @property

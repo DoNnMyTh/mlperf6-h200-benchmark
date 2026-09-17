@@ -1,0 +1,21 @@
+[build-system]
+requires = ["setuptools>=61"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "powermon"
+version = "0.2.0"
+description = "Record Linux power and temperature sensors to CSV, then graph and report"
+readme = "README.md"
+requires-python = ">=3.8"
+license = { text = "MIT" }
+dependencies = []
+
+[project.optional-dependencies]
+png = ["matplotlib>=3.3"]
+
+[project.scripts]
+powermon = "powermon.cli:main"
+
+[tool.setuptools]
+packages = ["powermon"]

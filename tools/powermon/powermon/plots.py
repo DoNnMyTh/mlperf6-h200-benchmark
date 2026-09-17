@@ -7,11 +7,14 @@ apart from rendering polish.
 from __future__ import annotations
 
 import math
+import os
+import site
+import sys
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence, Tuple
 
-from .stats import Summary
+from .stats import Summary, is_per_core
 
 PALETTE = [
     "#4e79a7", "#f28e2b", "#e15759", "#76b7b2", "#59a14f",
@@ -37,6 +40,7 @@ class Chart:
     elapsed: List[float]
     series: List[Series] = field(default_factory=list)
     note: str = ""
+    events: List[Tuple[float, str]] = field(default_factory=list)
 
 
 @dataclass
@@ -75,7 +79,8 @@ def build_charts(summary: Summary) -> List[Chart]:
 
     power_other = [c for c in cols if meta[c].kind == "power" and not is_gpu(c)]
     gpu_power = [c for c in cols if meta[c].kind == "power" and is_gpu(c)]
-    temps_other = [c for c in cols if meta[c].kind == "temp" and not is_gpu(c)]
+    temps_other = [c for c in cols if meta[c].kind == "temp" and not is_gpu(c) and not is_per_core(c)]
+    core_temps = [c for c in cols if meta[c].kind == "temp" and is_per_core(c)]
     gpu_temps = [c for c in cols if meta[c].kind == "temp" and is_gpu(c)]
     util = [c for c in cols if meta[c].kind == "util"]
 
@@ -91,6 +96,8 @@ def build_charts(summary: Summary) -> List[Chart]:
         charts.append(Chart("gpu_temps", "GPU temperatures", "°C", elapsed, _pick(summary, gpu_temps)))
     if temps_other:
         charts.append(Chart("temps", "Temperatures", "°C", elapsed, _pick(summary, temps_other)))
+    if core_temps:
+        charts.append(Chart("core_temps", "Per-core CPU temperatures", "°C", elapsed, _pick(summary, core_temps)))
     if util:
         charts.append(Chart("util", "GPU utilisation", "%", elapsed, _pick(summary, util)))
 
@@ -100,8 +107,13 @@ def build_charts(summary: Summary) -> List[Chart]:
         if not ch.series:
             continue
         if len(ch.series) > MAX_SERIES:
-            ch.note = f"showing {MAX_SERIES} of {len(ch.series)} series"
-            ch.series = ch.series[:MAX_SERIES]
+            # Keep the hottest / highest series so the interesting ones survive.
+            total = len(ch.series)
+            ranked = sorted(ch.series, key=lambda s: max(v for v in s.values if not math.isnan(v)), reverse=True)
+            keep = {s.name for s in ranked[:MAX_SERIES]}
+            ch.series = [s for s in ch.series if s.name in keep]
+            ch.note = f"showing {MAX_SERIES} highest of {total} series"
+        ch.events = [(e.elapsed_s, e.text) for e in summary.events]
         out.append(ch)
     return out
 
@@ -223,6 +235,14 @@ def render_svg(chart: Chart, width: int = 960, height: int = 380) -> str:
             pen_down = True
         if d:
             parts.append(f'<path d="{" ".join(d)}" fill="none" stroke="{color}" stroke-width="1.5" stroke-linejoin="round"/>')
+    for k, (ev_x, ev_text) in enumerate(chart.events):
+        exx = ev_x / div
+        if exx < x_lo or exx > x_hi:
+            continue
+        x = sx(exx)
+        parts.append(f'<line x1="{x:.1f}" y1="{mt}" x2="{x:.1f}" y2="{mt + ph}" stroke="#444" stroke-dasharray="4 3"/>')
+        ty = mt + 12 + (k % 4) * 14
+        parts.append(f'<text x="{x + 4:.1f}" y="{ty}" fill="#444" font-size="11">{_esc(ev_text[:28])}</text>')
     lx = ml + pw + 14
     for i, series in enumerate(chart.series[:legend_rows]):
         color = PALETTE[i % len(PALETTE)]
@@ -242,7 +262,22 @@ def _esc(text: str) -> str:
 # -------------------------------------------------------------------- PNG
 
 
+def _ensure_user_site() -> None:
+    """Add ~/.local site-packages if it appeared after this interpreter started.
+
+    Python only registers the user site directory at startup; a worker that
+    began before `pip install --user matplotlib` would otherwise never see it.
+    """
+    try:
+        user_site = site.getusersitepackages()
+    except Exception:  # noqa: BLE001
+        return
+    if user_site and os.path.isdir(user_site) and user_site not in sys.path:
+        site.addsitedir(user_site)
+
+
 def matplotlib_available() -> bool:
+    _ensure_user_site()
     try:
         import matplotlib  # noqa: F401
     except Exception:  # noqa: BLE001 - any import problem means "no"
@@ -251,6 +286,7 @@ def matplotlib_available() -> bool:
 
 
 def render_png(chart: Chart, path: Path) -> bool:
+    _ensure_user_site()
     try:
         import matplotlib
 
@@ -264,6 +300,11 @@ def render_png(chart: Chart, path: Path) -> bool:
     fig, ax = plt.subplots(figsize=(11, 4.4), dpi=110)
     for i, (series, col) in enumerate(zip(chart.series, ys)):
         ax.plot(xs, col, label=series.label[:34], color=PALETTE[i % len(PALETTE)], linewidth=1.2)
+    for k, (ev_x, ev_text) in enumerate(chart.events):
+        exx = ev_x / div
+        ax.axvline(exx, color="#444", linestyle="--", linewidth=0.9)
+        ax.text(exx, 0.98 - (k % 4) * 0.07, " " + ev_text[:28], transform=ax.get_xaxis_transform(),
+                fontsize=7.5, color="#444", va="top")
     ax.set_title(chart.title, loc="left", fontsize=13, fontweight="bold")
     ax.set_xlabel(x_label)
     ax.set_ylabel(chart.y_label)

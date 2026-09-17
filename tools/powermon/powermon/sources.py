@@ -50,6 +50,19 @@ def sanitize(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
 
 
+_PER_CORE_RE = re.compile(r"^core[\s_]*\d+$", re.I)
+
+
+def is_per_core_label(label: str) -> bool:
+    """True for hwmon labels like 'Core 12' (coretemp per-core inputs)."""
+    return bool(_PER_CORE_RE.match(label.strip()))
+
+
+def is_per_core_column(name: str) -> bool:
+    """True for column names like 'coretemp_core_12_c' / 'coretemp_2_core_3_c'."""
+    return bool(re.search(r"_core_\d+_c$", name))
+
+
 def _read_text(path: Path) -> str:
     return path.read_text(encoding="utf-8", errors="replace").strip()
 
@@ -255,11 +268,13 @@ class HwmonSource(Source):
     id = "hwmon"
     title = "hwmon temps/power"
 
-    def __init__(self, root: Path = Path("/"), log: Logger = _noop_log) -> None:
+    def __init__(self, root: Path = Path("/"), log: Logger = _noop_log, skip_per_core: bool = False) -> None:
         super().__init__(log)
         self.root = Path(root)
+        self.skip_per_core = skip_per_core
         self._paths: Dict[str, Path] = {}
         self._scale: Dict[str, float] = {}
+        self.skipped_per_core = 0
 
     def probe(self) -> ProbeResult:
         base = self.root / "sys" / "class" / "hwmon"
@@ -304,6 +319,9 @@ class HwmonSource(Source):
                             label = _read_text(label_path)
                         except OSError:
                             label = ""
+                    if kind == "temp" and self.skip_per_core and is_per_core_label(label):
+                        self.skipped_per_core += 1
+                        continue
                     part = sanitize(label) if label else f"{kind}{idx}"
                     name = f"{prefix}_{part}_{suffix}"
                     if name in used_cols:
@@ -323,8 +341,12 @@ class HwmonSource(Source):
                     self._paths[name] = f
                     self._scale[name] = scale
         if self._columns:
-            note = f"capped at {MAX_HWMON_COLUMNS} columns" if capped else ""
-            return self._result("ok", note)
+            notes = []
+            if capped:
+                notes.append(f"capped at {MAX_HWMON_COLUMNS} columns")
+            if self.skipped_per_core:
+                notes.append(f"{self.skipped_per_core} per-core temps skipped")
+            return self._result("ok", "; ".join(notes))
         if denied:
             return self._result("denied", "hwmon inputs not readable")
         return self._result("absent", "no readable hwmon inputs")
@@ -708,6 +730,7 @@ def probe_all(
     runner: Runner = default_runner,
     which: Which = shutil.which,
     log: Logger = _noop_log,
+    per_core: bool = True,
 ) -> List[tuple]:
     """Build and probe every source. Returns ``[(source, ProbeResult), ...]``.
 
@@ -729,7 +752,7 @@ def probe_all(
         return res
 
     add(RaplSource(root, log))
-    hwmon = HwmonSource(root, log)
+    hwmon = HwmonSource(root, log, skip_per_core=not per_core)
     add(hwmon)
     thermal = ThermalZoneSource(root, log)
     if "thermal" in enabled_set and hwmon.temp_count > 0:

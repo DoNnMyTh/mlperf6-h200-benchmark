@@ -108,4 +108,6 @@ if [[ $# -eq 0 && ! -t 0 ]]; then
   exit 2
 fi
 
+# Lets powermon print hints as "./tools/powermon.sh status ..." instead of the raw python entry.
+export POWERMON_LAUNCHER="${BASH_SOURCE[0]}"
 exec "${PY}" "${ENTRY}" "$@"

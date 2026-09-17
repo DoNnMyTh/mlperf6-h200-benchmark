@@ -62,14 +62,30 @@ Commands:
 Non-interactive form (scripts, ssh one-liners):
 
 ```bash
-python3 powermon.py start --duration 30m --out /data/power --label llama31 --yes
-python3 powermon.py status            # progress of every run you started
-python3 powermon.py stop              # end early; the report is still generated
-python3 powermon.py report /data/power/run_20260917_142233_llama31   # regenerate graphs/report
-python3 powermon.py probe             # what would be recorded, without recording
+./tools/powermon.sh start --duration 30m --out /data/power --label llama31 --yes
+./tools/powermon.sh status            # progress of every run you started
+./tools/powermon.sh watch             # live one-line view, Ctrl-C leaves it running
+./tools/powermon.sh mark "training start"      # event shown on graphs and in the report
+./tools/powermon.sh stop              # end early; the report is still generated
+./tools/powermon.sh report /data/power/run_20260917_142233_llama31   # regenerate graphs/report
+./tools/powermon.sh compare RUN_A RUN_B -o compare.md   # idle vs load, before vs after
+./tools/powermon.sh probe             # what would be recorded, without recording
 ```
 
-Try it without real sensors: `python3 powermon.py start --demo --duration 60 --yes`.
+`status`, `watch`, `mark` and `stop` default to the single run you started;
+pass a run directory when there are several. `mark --at 120 --run-dir DIR`
+adds an event to a finished run and regenerates its report. `start
+--no-per-core` skips per-core `coretemp` inputs on big CPUs (keeps the CSV
+to package-level temps).
+
+Try it without real sensors: `./tools/powermon.sh start --demo --duration 60 --yes`.
+
+Install it on `PATH` instead (any host with pip; matplotlib optional via `[png]`):
+
+```bash
+pipx install ./tools/powermon            # or: python3 -m pip install --user ./tools/powermon[png]
+powermon --version
+```
 
 ## What gets recorded
 
@@ -98,9 +114,13 @@ Each run gets `<out>/run_<YYYYmmdd_HHMMSS>[_label]/` containing:
 | `samples.csv` | one row per sample: `timestamp` (local ISO 8601 with offset), `elapsed_s` (monotonic seconds since start), then one column per sensor. Empty cell = no reading. |
 | `sensors.json` | column → unit, kind (`power`/`temp`/`util`/`mem`), source, sysfs path or command; probe results |
 | `status.json` | live progress: state (`running`/`done`/`stopped`/`error`), samples, gaps, per-source error counts, last row |
-| `report.md`, `report.html` | overview, sensor table, min/mean/max/p95/last per column, energy in Wh per power column, graphs. HTML is self-contained. |
-| `power.png`, `gpu_power.png`, `gpu_temps.png`, `temps.png`, `util.png` | graphs (`.svg` instead when matplotlib is not installed) |
+| `report.md`, `report.html` | overview, sensor table, min/mean/max/p95/last per column, energy in Wh per power column, events, graphs. HTML is self-contained. |
+| `summary.json` | the same numbers machine-readable (used by the MLPerf final report) |
+| `events.csv` | marks added with `powermon mark`: `elapsed_s,timestamp,text` |
+| `power.png`, `gpu_power.png`, `gpu_temps.png`, `temps.png`, `core_temps.png`, `util.png` | graphs (`.svg` instead when matplotlib is not installed). Per-core CPU temps get their own chart; charts with more than 16 series show the 16 highest. Marks appear as dashed vertical lines. |
 | `worker.log`, `run.json`, `powermon.pid` | worker log, run configuration, worker PID |
+
+Times in the report are local time with the UTC offset, e.g. `2026-09-17 23:19:25 +05:30`.
 
 Energy (Wh) is the trapezoidal integral of each power column over
 `elapsed_s`. `total_gpu_w` and `total_cpu_w` are derived sums (CPU total uses
@@ -119,11 +139,24 @@ or power loss keeps everything up to the last few seconds.
 still writes the report. `report <dir|csv>` regenerates graphs and report at
 any time, including from a partial CSV of a run that is still going.
 
-`status` and `stop` with no argument use a per-user registry in
-`$XDG_STATE_HOME/powermon/active.json` (default `~/.local/state/powermon/`,
-override with `POWERMON_STATE_DIR`). A run started with `sudo` is registered
-under root's home, so as a normal user pass the run directory explicitly:
-`powermon status /data/power/run_…`.
+`status`, `watch`, `mark` and `stop` with no argument use a per-user registry
+in `$XDG_STATE_HOME/powermon/active.json` (default `~/.local/state/powermon/`,
+override with `POWERMON_STATE_DIR`).
+
+Running with `sudo` (needed for RAPL and IPMI) is handled: the registry stays
+in the invoking user's home, and the run folder plus everything in it is
+chowned back to that user, so `status`, `watch`, `report` and `compare` work
+without sudo afterwards. `stop` and `mark` on a root-owned running worker
+still need `sudo`; the tool prints the exact command when that is the case.
+
+## Use with the MLPerf harness
+
+`./scripts/run_all_mlperf6_h200.sh --powermon` (or `MLPERF_POWERMON=1`)
+records power for the exact duration of each benchmark run. Each run gets its
+own folder under `MLPERF_POWERMON_ROOT` (default `<results>/orchestration/powermon/<benchmark>-<utc stamp>/`),
+the pipeline status gets a `power` stage per benchmark, and the final report
+gains a "Power and Thermal" table (headline column, mean/max W, energy Wh,
+link to the per-run report). Run the pipeline with `sudo` to include RAPL/IPMI.
 
 ## Graphs
 
@@ -162,3 +195,5 @@ docker build -f tools/powermon/Dockerfile.test --build-arg PYTHON_VERSION=3.12 -
 | `worker exited early` | see the printed tail of `worker.log`; usually an unwritable output folder. |
 | status shows `dead (worker gone without finalizing)` | worker was killed with SIGKILL or the host rebooted. Data up to that point is in `samples.csv`; run `report <dir>` to build the report. |
 | Graphs are `.svg` not `.png` | matplotlib not installed for the interpreter that ran the worker; install it and re-run `report <dir>`. |
+| `pip` refuses with `externally-managed-environment` | the launcher handles this (`--user --break-system-packages`, installs to `~/.local` only). Cleaner: `sudo apt install python3-venv` and delete `tools/powermon/.venv` so the next launch creates a venv. |
+| `status` shows nothing after `sudo … start` | update to 0.2: the registry now follows the invoking user. Older runs: pass the run directory. |

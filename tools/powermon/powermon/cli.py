@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import csv
 import json
 import os
 import re
@@ -17,6 +18,7 @@ from typing import List, Optional, Sequence
 
 from . import __version__, report
 from .recorder import (
+    EVENTS_CSV,
     PID_FILE,
     RUN_JSON,
     SAMPLES_CSV,
@@ -40,7 +42,8 @@ REGISTRY_MAX = 20
 
 
 def _stamp() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    # Local time with UTC offset, same convention as samples.csv timestamps.
+    return datetime.now(timezone.utc).astimezone().isoformat(timespec="seconds")
 
 
 def log_line(msg: str) -> None:
@@ -110,10 +113,47 @@ def pid_alive(pid: int) -> bool:
     return True
 
 
+def sudo_ids() -> Optional[tuple]:
+    """(uid, gid, home) of the invoking user when running under sudo, else None."""
+    if os.name != "posix" or getattr(os, "geteuid", lambda: 1)() != 0:
+        return None
+    user = os.environ.get("SUDO_USER")
+    if not user or user == "root":
+        return None
+    try:
+        import pwd
+
+        entry = pwd.getpwnam(user)
+    except (ImportError, KeyError):
+        return None
+    return entry.pw_uid, entry.pw_gid, Path(entry.pw_dir)
+
+
+def chown_to_sudo_user(path: Path, recursive: bool = False) -> None:
+    """Hand files created as root back to the user who typed `sudo`."""
+    ids = sudo_ids()
+    if ids is None:
+        return
+    uid, gid, _home = ids
+    targets = [path]
+    if recursive and path.is_dir():
+        targets += list(path.rglob("*"))
+    for t in targets:
+        try:
+            os.chown(t, uid, gid)
+        except OSError:
+            pass
+
+
 def state_dir() -> Path:
     env = os.environ.get("POWERMON_STATE_DIR")
     if env:
         return Path(env)
+    ids = sudo_ids()
+    if ids is not None:
+        # `sudo powermon start` must still be visible to `powermon status` run
+        # as the normal user, so the registry lives in that user's home.
+        return ids[2] / ".local" / "state" / "powermon"
     xdg = os.environ.get("XDG_STATE_HOME")
     base = Path(xdg) if xdg else Path.home() / ".local" / "state"
     return base / "powermon"
@@ -135,6 +175,8 @@ def registry_save(entries: List[dict]) -> None:
     try:
         registry_path().parent.mkdir(parents=True, exist_ok=True)
         registry_path().write_text(json.dumps(entries[-REGISTRY_MAX:], indent=2), encoding="utf-8")
+        for p in (registry_path(), registry_path().parent, registry_path().parent.parent):
+            chown_to_sudo_user(p)
     except OSError as exc:
         print(f"warning: could not write registry {registry_path()}: {exc}", file=sys.stderr)
 
@@ -166,6 +208,29 @@ def is_running(run_dir: Path) -> bool:
     return pid_alive(run_pid(run_dir))
 
 
+def resolve_run_dir(arg: Optional[str], running_only: bool, verb: str) -> Optional[Path]:
+    """Explicit run dir, or the single matching registry entry. Prints the reason on failure."""
+    if arg:
+        run_dir = Path(arg).expanduser().resolve()
+        if not run_dir.is_dir():
+            print(f"error: {run_dir} is not a directory")
+            return None
+        return run_dir
+    dirs = [Path(e["run_dir"]) for e in registry_prune()]
+    if running_only:
+        dirs = [d for d in dirs if is_running(d)]
+    if not dirs:
+        what = "running recordings" if running_only else "runs"
+        print(f"no {what} registered for this user. Pass a run directory: {_self_cmd()} {verb} <run_dir>")
+        return None
+    if len(dirs) > 1:
+        print(f"several runs match; pass a run directory: {_self_cmd()} {verb} <run_dir>")
+        for d in dirs:
+            print(f"  {d}")
+        return None
+    return dirs[0]
+
+
 def probe_table(probed: Sequence[tuple]) -> str:
     lines = []
     for src, res in probed:
@@ -193,7 +258,8 @@ def tail(path: Path, n: int = 15) -> str:
 def _run_recorder(cfg: RunConfig, logger, install_signals: bool) -> int:
     logger(f"powermon {__version__} worker pid {os.getpid()}")
     probed = probe_all(
-        interval=cfg.interval_s, enabled=cfg.sources, ipmi_every=cfg.ipmi_every, demo=cfg.demo, log=logger
+        interval=cfg.interval_s, enabled=cfg.sources, ipmi_every=cfg.ipmi_every, demo=cfg.demo, log=logger,
+        per_core=cfg.per_core,
     )
     logger("sensors:\n" + probe_table(probed))
     sources = active_sources(probed)
@@ -217,13 +283,17 @@ def _run_recorder(cfg: RunConfig, logger, install_signals: bool) -> int:
 
 
 def _finalize_report(run_dir: Path, plots: str, logger) -> None:
-    paths = report.generate(run_dir, plots)
-    if paths.nodata:
-        logger(f"report: {paths.message}")
-    else:
-        logger(f"report written: {paths.markdown} and {paths.html}")
-        for img in paths.images:
-            logger(f"graph: {img}")
+    try:
+        paths = report.generate(run_dir, plots)
+        if paths.nodata:
+            logger(f"report: {paths.message}")
+        else:
+            logger(f"report written: {paths.markdown} and {paths.html}")
+            for img in paths.images:
+                logger(f"graph: {img}")
+    finally:
+        # Under sudo everything here was created by root; give it back to the user.
+        chown_to_sudo_user(run_dir, recursive=True)
 
 
 def cmd_worker(args: argparse.Namespace) -> int:
@@ -248,6 +318,7 @@ def check_out_dir(out: Path, create: bool) -> Optional[str]:
             return f"{out} does not exist"
         try:
             out.mkdir(parents=True, exist_ok=True)
+            chown_to_sudo_user(out)
         except OSError as exc:
             return f"cannot create {out}: {exc}"
     if not out.is_dir():
@@ -289,6 +360,7 @@ def launch_background(cfg: RunConfig) -> int:
             cwd=str(TOOL_ROOT), **popen_kwargs,
         )
     (run_dir / PID_FILE).write_text(str(proc.pid), encoding="utf-8")
+    chown_to_sudo_user(run_dir, recursive=True)
     registry_add(run_dir, proc.pid, cfg.label)
     # Give the worker a moment to probe and fail fast if it cannot record.
     deadline = time.monotonic() + 3.0
@@ -309,12 +381,37 @@ def launch_background(cfg: RunConfig) -> int:
     print(f"  report  : {run_dir / report.REPORT_HTML}  (written when the run ends)")
     print("Commands:")
     print(f"  {_self_cmd()} status {run_dir}")
+    print(f"  {_self_cmd()} watch {run_dir}")
+    print(f"  {_self_cmd()} mark \"training start\" --run-dir {run_dir}")
     print(f"  {_self_cmd()} stop {run_dir}     (ends early; report still generated)")
     return 0
 
 
+def _display_path(path: str) -> str:
+    try:
+        rel = os.path.relpath(path)
+    except ValueError:
+        return path
+    if rel.startswith(".."):
+        return path
+    return rel if rel.startswith(".") else f"./{rel}"
+
+
 def _self_cmd() -> str:
-    return "powermon" if shutil.which("powermon") else f"python3 {SHIM.name}"
+    launcher = os.environ.get("POWERMON_LAUNCHER")
+    if launcher:
+        cmd = _display_path(launcher)
+    elif shutil.which("powermon"):
+        cmd = "powermon"
+    else:
+        cmd = f"python3 {_display_path(str(SHIM))}"
+    if sudo_ids() is not None:
+        cmd = "sudo " + cmd
+    return cmd
+
+
+def _unsudo(cmd: str) -> str:
+    return cmd[5:] if cmd.startswith("sudo ") else cmd
 
 
 def build_config(args: argparse.Namespace, out: Path, label: str, duration: float, interval: float,
@@ -330,6 +427,7 @@ def build_config(args: argparse.Namespace, out: Path, label: str, duration: floa
         fsync_every=max(0, int(getattr(args, "fsync_every", 60))),
         demo=bool(getattr(args, "demo", False)),
         plots=getattr(args, "plots", "auto") or "auto",
+        per_core=not bool(getattr(args, "no_per_core", False)),
     )
 
 
@@ -394,8 +492,9 @@ def cmd_start(args: argparse.Namespace) -> int:
 
 
 def ask(prompt: str, default: str, parse=None) -> str:
+    shown = f"{prompt} [{default}]: " if default else f"{prompt}: "
     while True:
-        raw = input(f"{prompt} [{default}]: ").strip()
+        raw = input(shown).strip()
         value = raw or default
         if parse is None:
             return value
@@ -453,9 +552,9 @@ def wizard(args: argparse.Namespace) -> int:
     if warn:
         print(f"  {warn}")
     interval = parse_interval(ask("Sample interval seconds", "1", parse_interval))
-    label = ask("Run label (optional, used in folder name)", "")
+    label = ask("Run label (optional, Enter to skip; used in folder name)", "")
     ns = argparse.Namespace(
-        run_dir=None, ipmi_every=1, fsync_every=60, demo=demo, plots=args.plots,
+        run_dir=None, ipmi_every=1, fsync_every=60, demo=demo, plots=args.plots, no_per_core=False,
     )
     cfg = build_config(ns, out, label, duration, interval, parse_sources(args.sources))
     print()
@@ -551,6 +650,9 @@ def stop_run(run_dir: Path, timeout: float) -> int:
     print(f"stopping pid {pid} ...")
     try:
         os.kill(pid, signal.SIGTERM)
+    except PermissionError:
+        print(f"error: pid {pid} belongs to another user (started with sudo?). Try: sudo {_unsudo(_self_cmd())} stop {run_dir}")
+        return 1
     except OSError as exc:
         print(f"error: could not signal pid {pid}: {exc}")
         return 1
@@ -573,22 +675,141 @@ def stop_run(run_dir: Path, timeout: float) -> int:
 def cmd_stop(args: argparse.Namespace) -> int:
     if not require_posix("stop"):
         return 2
-    if args.run_dir:
-        dirs = [Path(args.run_dir).expanduser().resolve()]
-    else:
+    if args.all:
         dirs = [Path(e["run_dir"]) for e in registry_prune() if is_running(Path(e["run_dir"]))]
         if not dirs:
-            print("no running powermon workers registered for this user. Pass a run directory: powermon stop <run_dir>")
+            print("no running recordings registered for this user")
             return 1
-        if len(dirs) > 1 and not args.all:
-            print("several workers are running; pass a run directory or --all:")
-            for d in dirs:
-                print(f"  {d}")
+    else:
+        one = resolve_run_dir(args.run_dir, running_only=True, verb="stop")
+        if one is None:
             return 1
+        dirs = [one]
     rc = 0
     for run_dir in dirs:
         rc = max(rc, stop_run(run_dir, args.timeout))
     return rc
+
+
+# -------------------------------------------------------------------- mark
+
+
+def run_started_at(run_dir: Path) -> Optional[datetime]:
+    for name in (RUN_JSON, "status.json"):
+        try:
+            data = json.loads((run_dir / name).read_text(encoding="utf-8"))
+            raw = data.get("started_at")
+            if raw:
+                return datetime.fromisoformat(raw)
+        except (OSError, ValueError, AttributeError):
+            continue
+    return None
+
+
+def add_mark(run_dir: Path, text: str, at: Optional[float] = None) -> float:
+    """Append an event to <run_dir>/events.csv; returns the elapsed seconds used."""
+    if at is None:
+        started = run_started_at(run_dir)
+        if started is None:
+            raise ValueError("cannot determine when the run started; pass --at SECONDS")
+        if started.tzinfo is None:
+            started = started.astimezone()
+        now = datetime.now(timezone.utc).astimezone()
+        at = max(0.0, (now - started).total_seconds())
+    path = run_dir / EVENTS_CSV
+    new = not path.exists()
+    with open(path, "a", newline="", encoding="utf-8") as fh:
+        writer = csv.writer(fh)
+        if new:
+            writer.writerow(["elapsed_s", "timestamp", "text"])
+        writer.writerow([f"{at:.3f}", _stamp(), text])
+    chown_to_sudo_user(path)
+    return at
+
+
+def cmd_mark(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_dir(args.run_dir, running_only=args.at is None, verb="mark")
+    if run_dir is None:
+        return 1
+    text = " ".join(args.text).strip()
+    if not text:
+        print("error: empty mark text")
+        return 2
+    try:
+        at = add_mark(run_dir, text, args.at)
+    except PermissionError:
+        print(f"error: {run_dir / EVENTS_CSV} is not writable (run started with sudo?). Try: sudo {_unsudo(_self_cmd())} mark ...")
+        return 1
+    except (OSError, ValueError) as exc:
+        print(f"error: {exc}")
+        return 1
+    print(f"marked '{text}' at {fmt_hms(at)} ({at:.1f}s) in {run_dir}")
+    if not is_running(run_dir) and (run_dir / report.REPORT_MD).exists():
+        report.generate(run_dir, args.plots)
+        print("report regenerated with the new mark")
+    return 0
+
+
+# ------------------------------------------------------------------- watch
+
+
+def watch_line(status: dict) -> str:
+    duration = float(status.get("duration_s") or 0)
+    elapsed = float(status.get("elapsed_s") or 0)
+    prog = fmt_hms(elapsed) + (f"/{fmt_hms(duration)}" if duration else "")
+    last = status.get("last_row") or {}
+    power = sorted(((k, v) for k, v in last.items() if k.endswith("_w")), key=lambda kv: -kv[1])
+    temps = sorted(((k, v) for k, v in last.items() if k.endswith("_c")), key=lambda kv: -kv[1])
+    bits = [f"{status.get('state', '?')} {prog}", f"n={status.get('samples', 0)} gaps={status.get('gaps', 0)}"]
+    bits += [f"{k}={v:.0f}W" for k, v in power[:4]]
+    bits += [f"{k}={v:.0f}C" for k, v in temps[:2]]
+    return "  ".join(bits)
+
+
+def cmd_watch(args: argparse.Namespace) -> int:
+    run_dir = resolve_run_dir(args.run_dir, running_only=False, verb="watch")
+    if run_dir is None:
+        return 1
+    print(f"watching {run_dir}  (Ctrl-C to leave; the recording keeps running)")
+    width = 0
+    while True:
+        status = read_status(run_dir)
+        line = watch_line(status) if status else "waiting for status.json ..."
+        print("\r" + line + " " * max(0, width - len(line)), end="", flush=True)
+        width = len(line)
+        if status and status.get("final"):
+            print()
+            _print_finished(run_dir, args.plots)
+            return 0
+        if args.once:
+            print()
+            return 0
+        time.sleep(max(0.2, args.interval))
+
+
+# ----------------------------------------------------------------- compare
+
+
+def cmd_compare(args: argparse.Namespace) -> int:
+    summaries = []
+    for label, target in (("A", args.run_a), ("B", args.run_b)):
+        run_dir = Path(target).expanduser().resolve()
+        csv_path = None
+        if run_dir.is_file():
+            run_dir, csv_path = run_dir.parent, run_dir
+        try:
+            summaries.append(report.load_summary(run_dir, csv_path))
+        except Exception as exc:  # noqa: BLE001
+            print(f"error: run {label} ({target}): {exc}")
+            return 2
+    a, b = summaries
+    print(report.compare_text(a, b))
+    if args.out:
+        out = Path(args.out).expanduser()
+        out.parent.mkdir(parents=True, exist_ok=True)
+        out.write_text(report.compare_markdown(a, b), encoding="utf-8")
+        print(f"\n  markdown  {out}")
+    return 0
 
 
 # ------------------------------------------------------------------ report
@@ -603,7 +824,11 @@ def cmd_report(args: argparse.Namespace) -> int:
     if not run_dir.is_dir():
         print(f"error: {run_dir} is not a directory")
         return 2
-    paths = report.generate(run_dir, args.plots, csv_path)
+    try:
+        paths = report.generate(run_dir, args.plots, csv_path)
+    except PermissionError as exc:
+        print(f"error: cannot write into {run_dir} ({exc}). If the run was started with sudo, use: sudo {_unsudo(_self_cmd())} report {run_dir}")
+        return 1
     if paths.nodata:
         print(f"no usable data: {paths.message}")
         return 2
@@ -622,7 +847,7 @@ def cmd_probe(args: argparse.Namespace) -> int:
     except ValueError as exc:
         print(f"error: {exc}")
         return 2
-    probed = probe_all(interval=interval, enabled=sources, ipmi_every=1, demo=args.demo)
+    probed = probe_all(interval=interval, enabled=sources, ipmi_every=1, demo=args.demo, per_core=not args.no_per_core)
     print(probe_table(probed))
     active = active_sources(probed)
     cols = all_columns(active)
@@ -646,7 +871,7 @@ def build_parser() -> argparse.ArgumentParser:
     p.add_argument("--version", action="version", version=f"powermon {__version__}")
     p.add_argument("--sources", default="all", help=f"comma list of sources to probe (default all): {', '.join(ALL_SOURCES)}")
     p.add_argument("--plots", choices=("auto", "png", "svg"), default="auto", help="graph back end (auto: PNG if matplotlib is installed, else SVG)")
-    sub = p.add_subparsers(dest="command", metavar="{start,status,stop,report,probe}")
+    sub = p.add_subparsers(dest="command", metavar="{start,status,watch,mark,stop,report,compare,probe}")
 
     s = sub.add_parser("start", help="start a recording (background unless --foreground)")
     s.add_argument("-d", "--duration", default=DEFAULT_DURATION, help="e.g. 300, 90s, 5m, 2h; 0 = until 'stop' (default 300)")
@@ -657,6 +882,7 @@ def build_parser() -> argparse.ArgumentParser:
     s.add_argument("--ipmi-every", type=int, default=1, help="query IPMI only every N samples (default 1)")
     s.add_argument("--fsync-every", type=int, default=60, help="fsync the CSV every N rows (0 disables; default 60)")
     s.add_argument("--demo", action="store_true", help="record synthetic data instead of real sensors")
+    s.add_argument("--no-per-core", action="store_true", help="skip per-core coretemp inputs (keeps the CSV lean on big CPUs)")
     s.add_argument("-y", "--yes", action="store_true", help="do not ask for confirmation")
     s.add_argument("--foreground", action="store_true", help="record in this terminal instead of the background")
     s.add_argument("--overwrite", action="store_true", help="allow reusing a run directory that already has samples.csv")
@@ -679,7 +905,26 @@ def build_parser() -> argparse.ArgumentParser:
     pr = sub.add_parser("probe", help="list detected sensors and the columns that would be recorded")
     pr.add_argument("-i", "--interval", default="1")
     pr.add_argument("--demo", action="store_true")
+    pr.add_argument("--no-per-core", action="store_true")
     pr.set_defaults(func=cmd_probe)
+
+    mk = sub.add_parser("mark", help="add a labelled event (shown on graphs and in the report)")
+    mk.add_argument("text", nargs="+", help='event text, e.g. "training start"')
+    mk.add_argument("--run-dir", dest="run_dir", default=None, help="run directory (default: the single running one)")
+    mk.add_argument("--at", type=float, default=None, help="elapsed seconds instead of now (also allows marking finished runs)")
+    mk.set_defaults(func=cmd_mark)
+
+    wt = sub.add_parser("watch", help="live one-line view of a recording (Ctrl-C leaves it running)")
+    wt.add_argument("run_dir", nargs="?", help="run directory (default: the single registered one)")
+    wt.add_argument("-i", "--interval", type=float, default=1.0, help="refresh seconds (default 1)")
+    wt.add_argument("--once", action="store_true", help="print one line and exit")
+    wt.set_defaults(func=cmd_watch)
+
+    cp = sub.add_parser("compare", help="compare two runs (idle vs load, before vs after)")
+    cp.add_argument("run_a", help="run directory or samples.csv (A)")
+    cp.add_argument("run_b", help="run directory or samples.csv (B)")
+    cp.add_argument("-o", "--out", default=None, help="also write a markdown comparison here")
+    cp.set_defaults(func=cmd_compare)
 
     w = sub.add_parser("_worker")  # internal: no help entry, hidden by the metavar above
     w.add_argument("config")

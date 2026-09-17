@@ -85,7 +85,13 @@ if [[ "${POWERMON_NO_INSTALL:-0}" != "1" ]]; then
     if [[ "${PY}" == "${VENV}/bin/python" ]]; then
       pip_cmd=("${PY}" -m pip install --quiet --disable-pip-version-check -r "${REQS}")
     else
-      pip_cmd=("${PY}" -m pip install --quiet --disable-pip-version-check --user -r "${REQS}")
+      pip_cmd=("${PY}" -m pip install --quiet --disable-pip-version-check --no-warn-script-location --user -r "${REQS}")
+      # PEP 668 distros (Debian 12+, Ubuntu 23.04+) refuse pip outside a venv even
+      # with --user. The flag only lifts that marker; --user still installs into
+      # ~/.local, nothing under /usr is touched.
+      if "${PY}" -m pip install --help 2>/dev/null | grep -q -- '--break-system-packages'; then
+        pip_cmd+=(--break-system-packages)
+      fi
     fi
     if ! "${pip_cmd[@]}"; then
       note "dependency install failed (offline, or pip missing). Continuing without matplotlib:"

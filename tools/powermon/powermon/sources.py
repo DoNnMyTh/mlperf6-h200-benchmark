@@ -28,7 +28,7 @@ Which = Callable[[str], Optional[str]]
 Logger = Callable[[str], None]
 
 ALL_SOURCES = ("rapl", "hwmon", "thermal", "battery", "nvidia", "ipmi")
-MAX_HWMON_COLUMNS = 64
+MAX_HWMON_COLUMNS = 128
 
 
 def default_runner(args: Sequence[str], timeout: float) -> str:

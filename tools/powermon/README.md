@@ -31,10 +31,10 @@ The wizard probes the sensors, asks for duration, output folder, interval and
 an optional label, then starts a background worker:
 
 ```text
-powermon 0.1.0 - Linux power and temperature recorder
+powermon 0.2.0 - Linux power and temperature recorder
 Probing sensors...
   [ok]       CPU power (RAPL)             3 column(s)
-  [ok]       hwmon temps/power            8 column(s)
+  [ok]       hwmon temps/power            29 column(s)
   [disabled] thermal zones                              hwmon already provides temperatures
   [absent]   battery power                              no battery
   [ok]       NVIDIA GPUs (nvidia-smi)     40 column(s)  8 GPU(s): NVIDIA H200 NVL
@@ -43,10 +43,11 @@ Probing sensors...
 
 Duration (e.g. 300, 5m, 2h; 0 = until 'stop') [300]: 30m
 Output folder [./powermon_runs]: /data/power
+  created /data/power
 Sample interval seconds [1]:
-Run label (optional, used in folder name) []: llama31-quickrun
+Run label (optional, Enter to skip; used in folder name): llama31-quickrun
 
-Will record 51 columns every 1s for 00:30:00
+Will record 72 columns every 1s for 00:30:00
   into /data/power/run_20260917_142233_llama31-quickrun
 Start in background? [Y/n]:
 Started. PID 41233
@@ -55,9 +56,13 @@ Started. PID 41233
   log     : .../worker.log
   report  : .../report.html  (written when the run ends)
 Commands:
-  python3 powermon.py status /data/power/run_20260917_142233_llama31-quickrun
-  python3 powermon.py stop   /data/power/run_20260917_142233_llama31-quickrun
+  sudo ./tools/powermon.sh status /data/power/run_20260917_142233_llama31-quickrun
+  sudo ./tools/powermon.sh watch /data/power/run_20260917_142233_llama31-quickrun
+  sudo ./tools/powermon.sh mark "training start" --run-dir /data/power/run_20260917_142233_llama31-quickrun
+  sudo ./tools/powermon.sh stop /data/power/run_20260917_142233_llama31-quickrun     (ends early; report still generated)
 ```
+
+(The `sudo` prefix appears only when you started it with sudo; `status`, `watch`, `mark`, `report` and `compare` work without it afterwards.)
 
 Non-interactive form (scripts, ssh one-liners):
 

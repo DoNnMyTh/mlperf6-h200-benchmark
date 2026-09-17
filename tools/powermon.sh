@@ -63,20 +63,44 @@ PY="${BASE_PY}"
 
 has_matplotlib() { "$1" -c 'import matplotlib' >/dev/null 2>&1; }
 
+# Under `sudo`, do the dependency setup as the invoking user so the venv and
+# any ~/.local packages stay owned by that user (and land in *their* home,
+# not root's). The recording itself still runs as root.
+INVOKER=""
+if [[ "$(id -u)" -eq 0 && -n "${SUDO_USER:-}" && "${SUDO_USER}" != "root" ]]; then
+  INVOKER="${SUDO_USER}"
+fi
+as_invoker() {
+  if [[ -n "${INVOKER}" ]]; then
+    sudo -u "${INVOKER}" -H "$@"
+  else
+    "$@"
+  fi
+}
+
 # --- 2./3. dependencies -----------------------------------------------------
 if [[ "${POWERMON_NO_INSTALL:-0}" != "1" ]]; then
+  USER_SITE=""
   if [[ -x "${VENV}/bin/python" ]]; then
     PY="${VENV}/bin/python"
   elif has_matplotlib "${BASE_PY}"; then
     : # distro already provides matplotlib for the base interpreter; no venv needed
   else
     note "creating virtual environment in ${VENV}"
-    if "${BASE_PY}" -m venv --system-site-packages "${VENV}" >/dev/null 2>&1; then
+    if as_invoker "${BASE_PY}" -m venv --system-site-packages "${VENV}" >/dev/null 2>&1; then
       PY="${VENV}/bin/python"
     else
       rm -rf "${VENV}"
       note "could not create a venv (python3-venv missing?). Trying a user-level pip install instead."
       note "  Debian/Ubuntu fix: sudo apt install python3-venv"
+    fi
+  fi
+
+  if [[ "${PY}" != "${VENV}/bin/python" && -n "${INVOKER}" ]]; then
+    # root's python does not look in the invoking user's ~/.local; point it there.
+    USER_SITE=$(as_invoker "${PY}" -m site --user-site 2>/dev/null || true)
+    if [[ -n "${USER_SITE}" ]]; then
+      export PYTHONPATH="${USER_SITE}${PYTHONPATH:+:${PYTHONPATH}}"
     fi
   fi
 
@@ -93,7 +117,7 @@ if [[ "${POWERMON_NO_INSTALL:-0}" != "1" ]]; then
         pip_cmd+=(--break-system-packages)
       fi
     fi
-    if ! "${pip_cmd[@]}"; then
+    if ! as_invoker "${pip_cmd[@]}"; then
       note "dependency install failed (offline, or pip missing). Continuing without matplotlib:"
       note "  recording works unchanged; graphs will be SVG instead of PNG."
       note "  later: ${PY} -m pip install -r ${REQS} && ./tools/powermon.sh report <run_dir>"
@@ -110,4 +134,6 @@ fi
 
 # Lets powermon print hints as "./tools/powermon.sh status ..." instead of the raw python entry.
 export POWERMON_LAUNCHER="${BASH_SOURCE[0]}"
+# No __pycache__ in the checkout: a `sudo` run would otherwise leave root-owned .pyc files behind.
+export PYTHONDONTWRITEBYTECODE=1
 exec "${PY}" "${ENTRY}" "$@"

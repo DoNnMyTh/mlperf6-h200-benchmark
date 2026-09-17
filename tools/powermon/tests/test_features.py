@@ -52,6 +52,39 @@ class PerCoreTest(unittest.TestCase):
             self.assertEqual(len(src.columns), 3)
 
 
+class InvalidTempTest(unittest.TestCase):
+    def test_no_reading_sentinel_skipped_at_probe_and_mid_run(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            fs = FakeSysfs(Path(tmp))
+            d = fs.hwmon(0, "nvme", temps={1: (38000, "Composite")})
+            fs.hwmon(1, "nvme", temps={1: (-273150, "Composite")})  # empty slot
+            fs.thermal(0, "acpitz", -273150)
+            src = HwmonSource(Path(tmp))
+            res = src.probe()
+            self.assertEqual([c.name for c in src.columns], ["nvme_composite_c"])
+            self.assertIn("1 sensor(s) with no reading skipped", res.note)
+            write(d / "temp1_input", "-273150")
+            import math
+
+            self.assertTrue(math.isnan(src.read(0.0)["nvme_composite_c"]))
+            self.assertEqual(src.errors, 0)
+            from powermon.sources import ThermalZoneSource
+
+            tz = ThermalZoneSource(Path(tmp))
+            self.assertEqual(tz.probe().status, "absent")
+
+    def test_old_csv_sentinel_sanitised_in_stats(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            run = Path(tmp)
+            lines = ["timestamp,elapsed_s,nvme_composite_c,cpu_pkg0_w", "t,0.000,-273.150,10", "t,1.000,40.0,10", "t,2.000,-273.150,10"]
+            write(run / "samples.csv", "\n".join(lines) + "\n")
+            s = summarize(run)
+            col = next(c for c in s.stats if c.name == "nvme_composite_c")
+            self.assertEqual(col.n, 1)
+            self.assertEqual(col.min, 40.0)
+            self.assertEqual(s.data.values["nvme_composite_c"][0] != s.data.values["nvme_composite_c"][0], True)  # NaN
+
+
 class EventsAndSummaryTest(unittest.TestCase):
     def setUp(self) -> None:
         self._tmp = tempfile.TemporaryDirectory()

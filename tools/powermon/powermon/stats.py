@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
 from .recorder import EVENTS_CSV, SAMPLES_CSV, read_sensors, read_status
-from .sources import is_per_core_column
+from .sources import is_per_core_column, valid_temp
 
 NAN = float("nan")
 
@@ -286,6 +286,9 @@ def energy_wh(elapsed: Sequence[float], watts: Sequence[float]) -> float:
 
 
 def column_stats(name: str, meta: ColumnMeta, elapsed: Sequence[float], values: Sequence[float]) -> ColumnStats:
+    if meta.kind == "temp":
+        # CSVs recorded before 0.2.1 may carry the -273.15 "no reading" sentinel.
+        values = [v if (math.isnan(v) or valid_temp(v)) else NAN for v in values]
     clean = [v for v in values if not math.isnan(v)]
     if not clean:
         return ColumnStats(name, meta.unit, meta.kind, 0, NAN, NAN, NAN, NAN, NAN, None, meta.label, meta.source)
@@ -335,6 +338,9 @@ def summarize(run_dir: Path, csv_path: Optional[Path] = None) -> Summary:
     run_dir = Path(run_dir)
     data = load_csv(csv_path or run_dir / SAMPLES_CSV)
     meta = load_meta(run_dir, data.columns)
+    for c in data.columns:
+        if meta[c].kind == "temp":
+            data.values[c] = [v if (math.isnan(v) or valid_temp(v)) else NAN for v in data.values[c]]
     stats = [column_stats(c, meta[c], data.elapsed, data.values[c]) for c in data.columns]
     derived = derived_series(data, meta)
     derived_stats = [

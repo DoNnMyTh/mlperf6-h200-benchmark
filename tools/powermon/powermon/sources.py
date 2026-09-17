@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
 NAN = float("nan")
+# hwmon reports "no reading" as -273150 millidegrees on some NVMe/ACPI devices.
+MIN_VALID_TEMP_C = -100.0
+
+
+def valid_temp(value: float) -> bool:
+    return value > MIN_VALID_TEMP_C
 
 Runner = Callable[[Sequence[str], float], str]
 Which = Callable[[str], Optional[str]]
@@ -275,6 +281,7 @@ class HwmonSource(Source):
         self._paths: Dict[str, Path] = {}
         self._scale: Dict[str, float] = {}
         self.skipped_per_core = 0
+        self.skipped_invalid = 0
 
     def probe(self) -> ProbeResult:
         base = self.root / "sys" / "class" / "hwmon"
@@ -329,12 +336,16 @@ class HwmonSource(Source):
                     if name in used_cols:
                         continue
                     try:
-                        _read_int(f)
+                        raw = _read_int(f)
                     except PermissionError:
                         denied += 1
                         continue
                     except (OSError, ValueError):
                         # e.g. iwlwifi temp when radio is off: ENODATA. Skip.
+                        continue
+                    if kind == "temp" and not valid_temp(raw / scale):
+                        # Empty NVMe slot / absent sensor: -273.15 C placeholder.
+                        self.skipped_invalid += 1
                         continue
                     used_cols.add(name)
                     self._columns.append(Column(name, unit, kind, self.id, str(f), label))
@@ -346,6 +357,8 @@ class HwmonSource(Source):
                 notes.append(f"capped at {MAX_HWMON_COLUMNS} columns")
             if self.skipped_per_core:
                 notes.append(f"{self.skipped_per_core} per-core temps skipped")
+            if self.skipped_invalid:
+                notes.append(f"{self.skipped_invalid} sensor(s) with no reading skipped")
             return self._result("ok", "; ".join(notes))
         if denied:
             return self._result("denied", "hwmon inputs not readable")
@@ -355,9 +368,13 @@ class HwmonSource(Source):
         row = self._nan_row()
         for name, path in self._paths.items():
             try:
-                row[name] = _read_int(path) / self._scale[name]
+                value = _read_int(path) / self._scale[name]
             except (OSError, ValueError) as exc:
                 self._log_failure(f"{path}: {exc}")
+                continue
+            if self._scale[name] == 1000.0 and not valid_temp(value):
+                continue  # sensor went away mid-run: leave the cell empty
+            row[name] = value
         return row
 
     @property
@@ -396,7 +413,8 @@ class ThermalZoneSource(Source):
             if name in used:
                 continue
             try:
-                _read_int(temp)
+                if not valid_temp(_read_int(temp) / 1000.0):
+                    continue
             except (OSError, ValueError):
                 continue
             used.add(name)

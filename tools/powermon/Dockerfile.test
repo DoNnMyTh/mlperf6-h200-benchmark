@@ -1,0 +1,17 @@
+# Test image for powermon. Build/run from the repo root:
+#   docker build -f tools/powermon/Dockerfile.test -t powermon-test tools/powermon
+#   docker run --rm powermon-test
+# Matrix knobs:
+#   --build-arg WITH_MPL=0          exercise the stdlib SVG fallback
+#   --build-arg PYTHON_VERSION=3.12 newer interpreter
+ARG PYTHON_VERSION=3.8
+FROM python:${PYTHON_VERSION}-slim
+ARG WITH_MPL=1
+RUN if [ "$WITH_MPL" = "1" ]; then pip install --no-cache-dir "matplotlib>=3.3"; fi
+# Run as a normal user so permission-denied sensor paths are exercised.
+RUN useradd --create-home tester
+WORKDIR /app
+COPY --chown=tester:tester . /app
+ENV PYTHONDONTWRITEBYTECODE=1 POWERMON_STATE_DIR=/tmp/powermon-state
+USER tester
+CMD ["python", "-m", "unittest", "discover", "-s", "tests", "-v"]

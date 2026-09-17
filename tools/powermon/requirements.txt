@@ -1,0 +1,3 @@
+# Optional. powermon records and reports with the Python standard library only.
+# Install matplotlib to get PNG graphs instead of the built-in SVG charts.
+matplotlib>=3.3

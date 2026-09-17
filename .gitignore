@@ -8,3 +8,6 @@ generated/
 results/
 work/
 artifacts/
+powermon_runs/
+tools/powermon/.venv/
+.claude/

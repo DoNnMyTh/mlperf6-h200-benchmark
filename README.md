@@ -19,10 +19,12 @@ The target host profile (`t3ihpc07`) is already captured in
 - `configs/mlperf6-h200-4gpu.env`: all paths, image tags, dataset URIs, and run defaults
 - `scripts/`: the benchmark toolkit (see "H200 benchmark toolkit" below)
 - `generated/`: local report output (git-ignored)
+- `tools/powermon/`: standalone Linux power/temperature recorder (CSV + graphs + report); see [tools/powermon/README.md](tools/powermon/README.md)
+- `tools/powermon.sh`: one-shot launcher for powermon (installs its optional dependency, then starts it): `./tools/powermon.sh`
 
 ## Safety notes
 
-- Run output, downloaded data, and reports stay outside version control (`generated/`, `results/`, `work/`, `artifacts/` are git-ignored).
+- Run output, downloaded data, and reports stay outside version control (`generated/`, `results/`, `work/`, `artifacts/`, `powermon_runs/` are git-ignored).
 - Host labels, PCIe layout, package versions, driver versions, and GPU topology can be sensitive. Review anything you publish from this repo.
 
 ## Bootstrap commands

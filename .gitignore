@@ -11,3 +11,5 @@ artifacts/
 powermon_runs/
 tools/powermon/.venv/
 .claude/
+tools/powermon/build/
+tools/powermon/*.egg-info/

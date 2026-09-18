@@ -40,6 +40,9 @@ Options:
   --full                   Real convergence run (no time-box) instead of the
                            default hardware-perf mode. Use for a submission-style
                            run; takes hours per benchmark.
+  --powermon               Record host power/temperatures (tools/powermon) for the
+                           duration of each benchmark run; per-run report under
+                           MLPERF_POWERMON_ROOT and a section in the final report.
   -h, --help               Show this help
 
 Behavior:
@@ -96,6 +99,10 @@ while [[ $# -gt 0 ]]; do
       ;;
     --full)
       export MLPERF_QUICK_RUN=0
+      shift
+      ;;
+    --powermon)
+      export MLPERF_POWERMON=1
       shift
       ;;
     -h|--help)
@@ -585,16 +592,52 @@ download_flux() {
   download_r2_named "flux" "empty-encodings" "${MLPERF_FLUX_DATASET_PATH}/empty_encodings" "${MLPERF_FLUX_EMPTY_ENCODINGS_URI}" || return 1
 }
 
+POWERMON_ACTIVE_DIR=""
+
+powermon_start() {
+  local benchmark="$1"
+  local pm_dir="${MLPERF_POWERMON_ROOT}/${benchmark}-$(date -u +%Y%m%d_%H%M%S)"
+  mkdir -p "${MLPERF_POWERMON_ROOT}"
+  if bash "${REPO_ROOT}/tools/powermon.sh" start --duration 0 --run-dir "${pm_dir}" \
+      --label "${benchmark}" --yes >> "${RUN_LOG}" 2>&1; then
+    POWERMON_ACTIVE_DIR="${pm_dir}"
+    log "powermon recording ${benchmark} -> ${pm_dir}"
+  else
+    record_status "${benchmark}" "power" "failed" "powermon start failed; see ${RUN_LOG}"
+    log "powermon failed to start for ${benchmark}; continuing without power capture"
+  fi
+}
+
+powermon_stop() {
+  local benchmark="$1"
+  local pm_dir="${POWERMON_ACTIVE_DIR}"
+  [[ -n "${pm_dir}" ]] || return 0
+  POWERMON_ACTIVE_DIR=""
+  if bash "${REPO_ROOT}/tools/powermon.sh" stop "${pm_dir}" >> "${RUN_LOG}" 2>&1; then
+    record_status "${benchmark}" "power" "success" "${pm_dir}/report.md"
+    log "powermon report for ${benchmark} -> ${pm_dir}/report.md"
+  else
+    record_status "${benchmark}" "power" "failed" "${pm_dir}"
+    log "powermon stop failed for ${benchmark}; partial data may be in ${pm_dir}"
+  fi
+}
+
 run_benchmark() {
   local benchmark="$1"
   local command_text
+  local rc=0
   command_text=$(cat <<EOF
 set -euo pipefail
 cd "${REPO_ROOT}"
 bash ./scripts/run_mlperf6_h200.sh --env-file "${ENV_FILE}" --execute run "${benchmark}"
 EOF
 )
-  run_logged "${benchmark}" "run" "${command_text}"
+  if [[ "${MLPERF_POWERMON:-0}" == "1" ]]; then
+    powermon_start "${benchmark}"
+  fi
+  run_logged "${benchmark}" "run" "${command_text}" || rc=$?
+  powermon_stop "${benchmark}"
+  return "${rc}"
 }
 
 generate_report() {
@@ -611,6 +654,7 @@ generate_report() {
 
 on_exit() {
   local exit_code=$?
+  powermon_stop "pipeline" || true
   generate_report || true
   exit "${exit_code}"
 }

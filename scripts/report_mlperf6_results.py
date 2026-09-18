@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
@@ -341,10 +342,55 @@ def parse_pipeline_status(path: Path | None) -> list[PipelineStatus]:
     return rows
 
 
+@dataclass
+class PowerRow:
+    benchmark: str
+    state: str
+    duration_s: str
+    samples: str
+    headline: str
+    mean_w: str
+    max_w: str
+    energy_wh: str
+    report_path: str
+
+
+def _num(value: object, digits: int = 1) -> str:
+    return f"{value:.{digits}f}" if isinstance(value, (int, float)) else "-"
+
+
+def collect_power_rows(root: Path | None) -> list[PowerRow]:
+    """Read summary.json written by tools/powermon under MLPERF_POWERMON_ROOT."""
+    rows: list[PowerRow] = []
+    if root is None or not root.is_dir():
+        return rows
+    for summary_path in sorted(root.glob("*/summary.json")):
+        try:
+            data = json.loads(summary_path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        head = data.get("headline_power") or {}
+        rows.append(
+            PowerRow(
+                benchmark=str(data.get("label") or summary_path.parent.name),
+                state=str(data.get("state", "?")),
+                duration_s=_num(data.get("duration_s"), 0),
+                samples=str(data.get("samples", "-")),
+                headline=str(head.get("name") or "-"),
+                mean_w=_num(head.get("mean")),
+                max_w=_num(head.get("max")),
+                energy_wh=_num(head.get("energy_wh"), 2),
+                report_path=str(summary_path.parent / "report.md"),
+            )
+        )
+    return rows
+
+
 def render_markdown(
     env: dict[str, str],
     reports: list[BenchmarkReport],
     pipeline_rows: list[PipelineStatus],
+    power_rows: list[PowerRow] | None = None,
 ) -> str:
     lines = [
         "# MLPerf 6.0 H200 Report",
@@ -386,6 +432,27 @@ def render_markdown(
                 f"| {row.benchmark} | {row.stage} | {row.status} | {row.note} |"
             )
 
+    if power_rows:
+        lines.extend(
+            [
+                "",
+                "## Power and Thermal (powermon)",
+                "",
+                "| Benchmark | State | Duration (s) | Samples | Headline column | Mean W | Max W | Energy Wh | Report |",
+                "| --- | --- | ---: | ---: | --- | ---: | ---: | ---: | --- |",
+            ]
+        )
+        for prow in power_rows:
+            lines.append(
+                f"| {prow.benchmark} | {prow.state} | {prow.duration_s} | {prow.samples} | "
+                f"{prow.headline} | {prow.mean_w} | {prow.max_w} | {prow.energy_wh} | `{prow.report_path}` |"
+            )
+        lines.append("")
+        lines.append(
+            "- Headline column is chassis power (`system_w`, IPMI) when available, else total GPU power, "
+            "else CPU package power. Full per-sensor tables and graphs are in each run's `report.md`/`report.html`."
+        )
+
     lines.extend(
         [
             "",
@@ -423,7 +490,8 @@ def main() -> int:
         if "MLPERF_PIPELINE_STATUS_PATH" in env
         else None
     )
-    markdown = render_markdown(env, reports, pipeline_rows)
+    power_root = Path(env["MLPERF_POWERMON_ROOT"]) if env.get("MLPERF_POWERMON_ROOT") else None
+    markdown = render_markdown(env, reports, pipeline_rows, collect_power_rows(power_root))
 
     if args.output:
         output_path = Path(args.output)

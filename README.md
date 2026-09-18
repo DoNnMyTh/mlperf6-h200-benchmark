@@ -21,6 +21,7 @@ The target host profile (`t3ihpc07`) is already captured in
 - `generated/`: local report output (git-ignored)
 - `tools/powermon/`: standalone Linux power/temperature recorder (CSV + graphs + report); see [tools/powermon/README.md](tools/powermon/README.md)
 - `tools/powermon.sh`: one-shot launcher for powermon (installs its optional dependency, then starts it): `./tools/powermon.sh`
+- `./scripts/run_all_mlperf6_h200.sh --powermon`: records power/thermals around each benchmark run and adds a Power and Thermal table to the final report
 
 ## Safety notes
 

@@ -22,6 +22,12 @@ from pathlib import Path
 from typing import Callable, Dict, List, Optional, Sequence
 
 NAN = float("nan")
+# hwmon reports "no reading" as -273150 millidegrees on some NVMe/ACPI devices.
+MIN_VALID_TEMP_C = -100.0
+
+
+def valid_temp(value: float) -> bool:
+    return value > MIN_VALID_TEMP_C
 
 Runner = Callable[[Sequence[str], float], str]
 Which = Callable[[str], Optional[str]]
@@ -48,6 +54,19 @@ def _noop_log(_msg: str) -> None:
 
 def sanitize(text: str) -> str:
     return re.sub(r"[^a-z0-9]+", "_", text.lower()).strip("_")
+
+
+_PER_CORE_RE = re.compile(r"^core[\s_]*\d+$", re.I)
+
+
+def is_per_core_label(label: str) -> bool:
+    """True for hwmon labels like 'Core 12' (coretemp per-core inputs)."""
+    return bool(_PER_CORE_RE.match(label.strip()))
+
+
+def is_per_core_column(name: str) -> bool:
+    """True for column names like 'coretemp_core_12_c' / 'coretemp_2_core_3_c'."""
+    return bool(re.search(r"_core_\d+_c$", name))
 
 
 def _read_text(path: Path) -> str:
@@ -255,11 +274,14 @@ class HwmonSource(Source):
     id = "hwmon"
     title = "hwmon temps/power"
 
-    def __init__(self, root: Path = Path("/"), log: Logger = _noop_log) -> None:
+    def __init__(self, root: Path = Path("/"), log: Logger = _noop_log, skip_per_core: bool = False) -> None:
         super().__init__(log)
         self.root = Path(root)
+        self.skip_per_core = skip_per_core
         self._paths: Dict[str, Path] = {}
         self._scale: Dict[str, float] = {}
+        self.skipped_per_core = 0
+        self.skipped_invalid = 0
 
     def probe(self) -> ProbeResult:
         base = self.root / "sys" / "class" / "hwmon"
@@ -304,6 +326,9 @@ class HwmonSource(Source):
                             label = _read_text(label_path)
                         except OSError:
                             label = ""
+                    if kind == "temp" and self.skip_per_core and is_per_core_label(label):
+                        self.skipped_per_core += 1
+                        continue
                     part = sanitize(label) if label else f"{kind}{idx}"
                     name = f"{prefix}_{part}_{suffix}"
                     if name in used_cols:
@@ -311,20 +336,30 @@ class HwmonSource(Source):
                     if name in used_cols:
                         continue
                     try:
-                        _read_int(f)
+                        raw = _read_int(f)
                     except PermissionError:
                         denied += 1
                         continue
                     except (OSError, ValueError):
                         # e.g. iwlwifi temp when radio is off: ENODATA. Skip.
                         continue
+                    if kind == "temp" and not valid_temp(raw / scale):
+                        # Empty NVMe slot / absent sensor: -273.15 C placeholder.
+                        self.skipped_invalid += 1
+                        continue
                     used_cols.add(name)
                     self._columns.append(Column(name, unit, kind, self.id, str(f), label))
                     self._paths[name] = f
                     self._scale[name] = scale
         if self._columns:
-            note = f"capped at {MAX_HWMON_COLUMNS} columns" if capped else ""
-            return self._result("ok", note)
+            notes = []
+            if capped:
+                notes.append(f"capped at {MAX_HWMON_COLUMNS} columns")
+            if self.skipped_per_core:
+                notes.append(f"{self.skipped_per_core} per-core temps skipped")
+            if self.skipped_invalid:
+                notes.append(f"{self.skipped_invalid} sensor(s) with no reading skipped")
+            return self._result("ok", "; ".join(notes))
         if denied:
             return self._result("denied", "hwmon inputs not readable")
         return self._result("absent", "no readable hwmon inputs")
@@ -333,9 +368,13 @@ class HwmonSource(Source):
         row = self._nan_row()
         for name, path in self._paths.items():
             try:
-                row[name] = _read_int(path) / self._scale[name]
+                value = _read_int(path) / self._scale[name]
             except (OSError, ValueError) as exc:
                 self._log_failure(f"{path}: {exc}")
+                continue
+            if self._scale[name] == 1000.0 and not valid_temp(value):
+                continue  # sensor went away mid-run: leave the cell empty
+            row[name] = value
         return row
 
     @property
@@ -374,7 +413,8 @@ class ThermalZoneSource(Source):
             if name in used:
                 continue
             try:
-                _read_int(temp)
+                if not valid_temp(_read_int(temp) / 1000.0):
+                    continue
             except (OSError, ValueError):
                 continue
             used.add(name)
@@ -708,6 +748,7 @@ def probe_all(
     runner: Runner = default_runner,
     which: Which = shutil.which,
     log: Logger = _noop_log,
+    per_core: bool = True,
 ) -> List[tuple]:
     """Build and probe every source. Returns ``[(source, ProbeResult), ...]``.
 
@@ -729,7 +770,7 @@ def probe_all(
         return res
 
     add(RaplSource(root, log))
-    hwmon = HwmonSource(root, log)
+    hwmon = HwmonSource(root, log, skip_per_core=not per_core)
     add(hwmon)
     thermal = ThermalZoneSource(root, log)
     if "thermal" in enabled_set and hwmon.temp_count > 0:

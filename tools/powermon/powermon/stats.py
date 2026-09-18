@@ -8,7 +8,8 @@ from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Sequence
 
-from .recorder import SAMPLES_CSV, read_sensors, read_status
+from .recorder import EVENTS_CSV, SAMPLES_CSV, read_sensors, read_status
+from .sources import is_per_core_column, valid_temp
 
 NAN = float("nan")
 
@@ -56,6 +57,13 @@ class ColumnStats:
 
 
 @dataclass
+class Event:
+    elapsed_s: float
+    timestamp: str
+    text: str
+
+
+@dataclass
 class Summary:
     run_dir: Path
     data: RunData
@@ -65,6 +73,7 @@ class Summary:
     derived_stats: List[ColumnStats] = field(default_factory=list)
     status: Optional[dict] = None
     sensors: Optional[dict] = None
+    events: List[Event] = field(default_factory=list)
 
     @property
     def duration_s(self) -> float:
@@ -102,6 +111,54 @@ class Summary:
 
     def by_kind(self, kind: str) -> List[ColumnStats]:
         return [s for s in self.stats if s.kind == kind]
+
+    @property
+    def label(self) -> str:
+        return str((self.sensors or {}).get("label") or "")
+
+    def headline_power(self) -> Optional[ColumnStats]:
+        """The single most representative power column: chassis, else GPU total, else CPU total, else first."""
+        by_name = {s.name: s for s in self.stats + self.derived_stats}
+        for name in ("system_w", "total_gpu_w", "gpu0_power_w", "total_cpu_w", "cpu_pkg0_w", "bat0_w"):
+            if name in by_name and by_name[name].n:
+                return by_name[name]
+        power = [s for s in self.stats if s.kind == "power" and s.n]
+        return power[0] if power else None
+
+    def to_dict(self) -> dict:
+        """Machine-readable summary (written as summary.json next to the report)."""
+        def col(s: ColumnStats) -> dict:
+            d = {"name": s.name, "label": s.label, "unit": s.unit, "kind": s.kind, "source": s.source, "n": s.n,
+                 "min": _num(s.min), "mean": _num(s.mean), "max": _num(s.max), "p95": _num(s.p95), "last": _num(s.last)}
+            if s.energy_wh is not None:
+                d["energy_wh"] = _num(s.energy_wh)
+            return d
+        head = self.headline_power()
+        return {
+            "run_dir": str(self.run_dir),
+            "label": self.label,
+            "state": self.state,
+            "complete": self.complete,
+            "start": self.data.timestamps[0] if self.data.n else "",
+            "end": self.data.timestamps[-1] if self.data.n else "",
+            "duration_s": round(self.duration_s, 3),
+            "interval_s": self.interval_s,
+            "samples": self.data.n,
+            "expected_samples": self.expected_samples,
+            "gaps": self.gaps,
+            "dropped_rows": self.data.dropped_rows,
+            "errors": (self.status or {}).get("errors") or {},
+            "headline_power": col(head) if head else None,
+            "columns": [col(s) for s in self.stats],
+            "derived": [col(s) for s in self.derived_stats],
+            "events": [{"elapsed_s": e.elapsed_s, "timestamp": e.timestamp, "text": e.text} for e in self.events],
+        }
+
+
+def _num(v: float) -> Optional[float]:
+    if v is None or (isinstance(v, float) and math.isnan(v)):
+        return None
+    return round(v, 3)
 
 
 # --------------------------------------------------------------------- loading
@@ -150,6 +207,24 @@ def load_csv(path: Path) -> RunData:
     if len(elapsed) < 2:
         raise NoData(f"{path} has {len(elapsed)} usable sample(s); need at least 2")
     return RunData(columns, timestamps, elapsed, values, dropped)
+
+
+def load_events(run_dir: Path) -> List[Event]:
+    """events.csv rows: elapsed_s,timestamp,text (written by `powermon mark`)."""
+    path = Path(run_dir) / EVENTS_CSV
+    events: List[Event] = []
+    if not path.exists():
+        return events
+    with open(path, newline="", encoding="utf-8", errors="replace") as fh:
+        for row in csv.reader(fh):
+            if len(row) < 3 or row[0] == "elapsed_s":
+                continue
+            try:
+                events.append(Event(float(row[0]), row[1], row[2]))
+            except ValueError:
+                continue
+    events.sort(key=lambda e: e.elapsed_s)
+    return events
 
 
 def infer_meta(name: str) -> ColumnMeta:
@@ -211,6 +286,9 @@ def energy_wh(elapsed: Sequence[float], watts: Sequence[float]) -> float:
 
 
 def column_stats(name: str, meta: ColumnMeta, elapsed: Sequence[float], values: Sequence[float]) -> ColumnStats:
+    if meta.kind == "temp":
+        # CSVs recorded before 0.2.1 may carry the -273.15 "no reading" sentinel.
+        values = [v if (math.isnan(v) or valid_temp(v)) else NAN for v in values]
     clean = [v for v in values if not math.isnan(v)]
     if not clean:
         return ColumnStats(name, meta.unit, meta.kind, 0, NAN, NAN, NAN, NAN, NAN, None, meta.label, meta.source)
@@ -260,6 +338,9 @@ def summarize(run_dir: Path, csv_path: Optional[Path] = None) -> Summary:
     run_dir = Path(run_dir)
     data = load_csv(csv_path or run_dir / SAMPLES_CSV)
     meta = load_meta(run_dir, data.columns)
+    for c in data.columns:
+        if meta[c].kind == "temp":
+            data.values[c] = [v if (math.isnan(v) or valid_temp(v)) else NAN for v in data.values[c]]
     stats = [column_stats(c, meta[c], data.elapsed, data.values[c]) for c in data.columns]
     derived = derived_series(data, meta)
     derived_stats = [
@@ -275,4 +356,9 @@ def summarize(run_dir: Path, csv_path: Optional[Path] = None) -> Summary:
         derived_stats=derived_stats,
         status=read_status(run_dir),
         sensors=read_sensors(run_dir),
+        events=load_events(run_dir),
     )
+
+
+def is_per_core(name: str) -> bool:
+    return is_per_core_column(name)

@@ -596,7 +596,8 @@ POWERMON_ACTIVE_DIR=""
 
 powermon_start() {
   local benchmark="$1"
-  local pm_dir="${MLPERF_POWERMON_ROOT}/${benchmark}-$(date -u +%Y%m%d_%H%M%S)"
+  local safe_name="${benchmark//[^A-Za-z0-9_-]/_}"
+  local pm_dir="${MLPERF_POWERMON_ROOT}/${safe_name}-$(date -u +%Y%m%d_%H%M%S)"
   mkdir -p "${MLPERF_POWERMON_ROOT}"
   if bash "${REPO_ROOT}/tools/powermon.sh" start --duration 0 --run-dir "${pm_dir}" \
       --label "${benchmark}" --yes >> "${RUN_LOG}" 2>&1; then
